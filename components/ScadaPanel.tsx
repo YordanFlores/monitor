@@ -5,7 +5,8 @@ import mqtt, { type MqttClient } from "mqtt";
 import "./omnitec-scada.css";
 
 // --- CONFIGURACIÓN MQTT LOCAL (UBUNTU) ---
-const MQTT_WS_URL = "ws://192.168.100.40:9001";
+// Cambia la IP local por tu nuevo subdominio con seguridad SSL (wss)
+const MQTT_WS_URL = "wss://broker.omnitec.store";
 const cmdTopic = (unitId: string) => `omnitec/cmd/${unitId}`;
 const telemetryTopic = (unitId: string) => `omnitec/telemetry/${unitId}`;
 
