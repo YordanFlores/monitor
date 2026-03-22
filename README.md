@@ -1,49 +1,42 @@
-# OMNITEC Cloud
+# OMNITEC (MQTT local)
 
-Plataforma Next.js (App Router) para monitoreo de PLCs ESP32 (OMNIPLC-X), con Firebase Realtime Database (telemetría en vivo) y Firestore (configuración, PIN, tokens).
-
-## Requisitos
-
-- Node.js 20+
-- Proyecto Firebase con **Realtime Database** y **Firestore** habilitados
-- Cuenta de servicio (JSON) para el servidor (`/api/update`, validación de PIN)
+Frontend Next.js para SCADA de PLCs ESP32 sobre **MQTT** (Mosquitto en LAN). Sin Firebase ni `/api/update`.
 
 ## Variables de entorno
 
-Copia `.env.local.example` a `.env.local` y completa:
+Ver `.env.local.example`:
 
-- `NEXT_PUBLIC_FIREBASE_*` — configuración del cliente (consola Firebase)
-- `FIREBASE_SERVICE_ACCOUNT_JSON` — JSON completo de la cuenta de servicio en una línea
-- `SCADA_SESSION_SECRET` — cadena larga aleatoria para firmar la cookie de acceso al SCADA tras el PIN
+- `NEXT_PUBLIC_MQTT_WS_URL` — URL WebSocket del broker (por defecto en código: `ws://192.168.100.40:9001`). Si Mosquitto usa path `/mqtt`, pon `ws://192.168.100.40:9001/mqtt`.
+- `NEXT_PUBLIC_SCADA_UNITS` — Lista de IDs separados por coma para el dashboard.
+- `NEXT_PUBLIC_OMNITEC_SKIP_LOGIN=1` — Omite el overlay “ACCESO OMNITEC” (solo desarrollo en LAN).
+- `NEXT_PUBLIC_OMNITEC_LOGIN_PIN` — PIN de 4 dígitos: si coincide con lo que escribes en “ACCESO OMNITEC”, entras sin que el PLC tenga que mandar `authOk` en telemetría (útil mientras el firmware no lo implementa).
 
-## Registro de un PLC nuevo
+La UI del SCADA replica `WifiConfig.h` del firmware OMNITEC (mismas tarjetas, overlays, acordeón y lógica de progreso por fase).
 
-1. En Firestore, crea un documento en la colección **`provisionTokens`** con **ID = token** (el mismo string que enviará el ESP32) y el campo `unitId` con el nombre de la unidad (ej. `UNIDAD_01`).
-2. El ESP32 envía `POST /api/update` con `unidad` + `token`. Si la unidad no existe y el token coincide con `provisionTokens`, se crea el documento en **`units/{unidad}`** con PIN por defecto `1234` (cámbialo desde el SCADA).
+## Tópicos
 
-## Endpoint hardware
+| Dirección | Tópico | Payload |
+|-----------|--------|---------|
+| ESP → web | `omnitec/telemetry/{unitId}` | JSON de estado (cada ~1 s) |
+| Web → ESP | `omnitec/cmd/{unitId}` | JSON de comando / config |
 
-`POST /api/update`
+Ejemplos de publicación desde la web: `{"tCS":9000}`, `{"tCB":8000}`, `{"newPin":"1234"}`, `{"limC":10}`, `{"limM":120}`, `{"resetMante":"true"}`, `{"cmd":1}`.
 
-Cuerpo JSON (ejemplo):
+### PIN inicial (overlay ACCESO OMNITEC)
 
-```json
-{
-  "unidad": "UNIDAD_01",
-  "token": "tu_token",
-  "fase": 0,
-  "relays": 0,
-  "prog": 0,
-  "ms": 0,
-  "tS": 9000,
-  "tB": 9000,
-  "ciclos": 0,
-  "uso": 0,
-  "alerta": false
-}
-```
+Tras ENTRAR se publica **un solo JSON**: `{"authLogin":"<pin>","checkPin":"<pin>"}` (compatible con firmwares que solo tratan `checkPin`).
 
-Respuesta: `cmd`, `tCS`, `tCB`, y campos opcionales (`newPin`, `limC`, `limM`, `resetMante`) cuando haya pendientes en Firestore.
+El PLC debe, en el siguiente (o en algún) mensaje de `omnitec/telemetry/...`, incluir alguno de: **`authOk`**, **`loginOk`**, **`sessionOk`**, **`authLoginOk`**, **`pinCheckOk`**, **`configUnlocked`**, **`pinOk`**, **`authResult":"OK"`**, **`loginResult":"OK"`**.
+
+Si aún no tienes eso en el firmware, define **`NEXT_PUBLIC_OMNITEC_LOGIN_PIN`** en `.env.local` con el mismo PIN de 4 dígitos del PLC, o usa **`NEXT_PUBLIC_OMNITEC_SKIP_LOGIN=1`**.
+
+### PIN de “CONFIGURACIÓN AVANZADA”
+
+`{"checkPin":"XXXX"}` y en telemetría `pinCheckOk` o `configUnlocked: true` para desbloquear el panel de edición.
+
+## Telemetría (campos reconocidos)
+
+La UI normaliza nombres habituales: `tS` / `tCS` y `tB` / `tCB` (ms), `fase`, `prog`, `ms`, `relays`, `ciclos`, `uso`, `limC`, `limM` (segundos para el límite de tiempo de uso; el placeholder de horas usa `limM/3600`), `alerta`.
 
 ## Desarrollo
 
@@ -52,16 +45,9 @@ npm install
 npm run dev
 ```
 
-## Producción (Ubuntu + PM2)
+## Producción (PM2)
 
 ```bash
 npm run build
 pm2 start ecosystem.config.cjs
-pm2 save
 ```
-
-Proxy inverso (nginx/caddy) hacia el puerto configurado (`PORT`, por defecto 3000).
-
-## Reglas de seguridad Firebase
-
-Configura reglas para que solo usuarios autenticados accedan a Firestore/RTDB según tu política; el backend usa la cuenta de servicio y no depende de esas reglas para `/api/update`.

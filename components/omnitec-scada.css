@@ -1,5 +1,5 @@
-/* Extraído de WifiConfig.h — misma estética AP local */
-.root {
+/* Copiado de OMNITEC WifiConfig.h — body → .omnitec-scada */
+.omnitec-scada {
   --escala: 1.8;
   --global-x: 0px;
   --global-y: 20px;
@@ -32,13 +32,13 @@
   box-sizing: border-box;
 }
 
-.root *,
-.root *::before,
-.root *::after {
+.omnitec-scada *,
+.omnitec-scada *::before,
+.omnitec-scada *::after {
   box-sizing: border-box;
 }
 
-.cineMode {
+.omnitec-scada #cine-mode {
   position: fixed;
   top: 0;
   left: 0;
@@ -52,11 +52,11 @@
   overflow: hidden;
 }
 
-.cineModeOpen {
+.omnitec-scada #cine-mode.cine-open {
   display: flex;
 }
 
-.cineViewport {
+.omnitec-scada #cine-viewport {
   position: relative;
   width: 1000px;
   height: 600px;
@@ -64,7 +64,7 @@
   transform: scale(var(--escala));
 }
 
-.truckGroup {
+.omnitec-scada #truck-group {
   position: absolute;
   top: 0;
   left: 0;
@@ -73,14 +73,14 @@
   transform: translate(var(--global-x), var(--global-y));
 }
 
-.truckPart {
+.omnitec-scada .truck-part {
   position: absolute;
   background-repeat: no-repeat;
   background-size: contain;
   background-position: center;
 }
 
-.truckChassis {
+.omnitec-scada .truck-chassis {
   bottom: var(--ch-y);
   left: var(--ch-x);
   width: 1150px;
@@ -89,7 +89,7 @@
   background-image: url("/Chasis.svg");
 }
 
-.truckBedWrapper {
+.omnitec-scada .truck-bed-wrapper {
   position: absolute;
   z-index: 20;
   transition: none;
@@ -100,14 +100,14 @@
   transform-origin: var(--to-px) var(--to-py);
 }
 
-.truckBedImg {
+.omnitec-scada .truck-bed-img {
   width: 100%;
   height: 100%;
   background-image: url("/tolva.svg");
   transform: rotate(-32deg);
 }
 
-.truckGateWrapper {
+.omnitec-scada .truck-gate-wrapper {
   position: absolute;
   z-index: 30;
   top: var(--co-y);
@@ -117,14 +117,14 @@
   transform-origin: var(--co-px) var(--co-py);
 }
 
-.truckGateImg {
+.omnitec-scada .truck-gate-img {
   width: 100%;
   height: 100%;
   background-image: url("/Compuerta.svg");
   transform: rotate(0deg);
 }
 
-.hudFixed {
+.omnitec-scada .hud-fixed {
   position: fixed;
   bottom: 40px;
   left: 40px;
@@ -134,26 +134,26 @@
   background: linear-gradient(90deg, rgba(0, 0, 0, 0.8) 0%, transparent 100%);
 }
 
-.hudContent {
+.omnitec-scada .hud-content {
   opacity: 0;
   transform: translateX(-20px);
   transition: 0.5s ease;
   font-family: monospace;
 }
 
-.hudContentVisible {
+.omnitec-scada .hud-content.visible {
   opacity: 1;
   transform: translateX(0);
 }
 
-.hudVal {
+.omnitec-scada .hud-val {
   font-size: 2.2rem;
   color: var(--verde);
   font-weight: 900;
   font-family: monospace;
 }
 
-.hudLabel {
+.omnitec-scada .hud-label {
   color: #888;
   font-size: 0.7rem;
   text-transform: uppercase;
@@ -162,7 +162,7 @@
   margin-bottom: 5px;
 }
 
-.btnVolverFix {
+.omnitec-scada .btn-volver-fix {
   position: fixed;
   bottom: 40px;
   right: 40px;
@@ -180,7 +180,7 @@
   transition: 0.3s;
 }
 
-.btnVolverFix::before {
+.omnitec-scada .btn-volver-fix::before {
   content: "";
   width: 16px;
   height: 16px;
@@ -190,13 +190,362 @@
   margin-left: 8px;
 }
 
-.btnVolverFix:hover {
+.omnitec-scada .btn-volver-fix:hover {
   background: var(--rojo);
   border-color: white;
   transform: scale(1.1);
 }
 
-.btnMuteWeb {
+.omnitec-scada .contenedor {
+  max-width: 500px;
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.omnitec-scada .tarjeta {
+  background: var(--tarjeta);
+  padding: 20px;
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8);
+  position: relative;
+}
+
+.omnitec-scada .btn-animacion-pro {
+  background: #000;
+  border: 2px solid var(--azul);
+  color: white;
+  padding: 22px;
+  border-radius: 12px;
+  font-weight: 900;
+  font-size: 1.2rem;
+  width: 100%;
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 4px;
+  box-shadow: 0 0 20px rgba(0, 136, 255, 0.3);
+  transition: 0.3s;
+  margin-bottom: 15px;
+}
+
+.omnitec-scada .btn-animacion-pro:hover {
+  border-color: var(--verde);
+  box-shadow: 0 0 35px var(--verde);
+  background: #050505;
+}
+
+.omnitec-scada .status-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.omnitec-scada .badge-online {
+  padding: 6px 12px;
+  border-radius: 50px;
+  border: 1px solid var(--verde);
+  color: var(--verde);
+  font-size: 0.65rem;
+  font-weight: 900;
+  background: rgba(0, 255, 102, 0.05);
+}
+
+.omnitec-scada .badge-wifi {
+  padding: 6px 12px;
+  border-radius: 50px;
+  border: 1px solid var(--ambar);
+  color: var(--ambar);
+  font-size: 0.65rem;
+  font-weight: 900;
+  background: rgba(255, 191, 0, 0.05);
+  cursor: pointer;
+}
+
+.omnitec-scada .reloj-big {
+  font-family: monospace;
+  font-size: 2.2rem;
+  color: var(--verde);
+  font-weight: bold;
+  text-align: center;
+}
+
+.omnitec-scada .estado-centro {
+  font-size: 0.65rem;
+  font-weight: bold;
+  color: var(--azul);
+  text-transform: uppercase;
+  margin-top: 5px;
+  text-align: center;
+}
+
+.omnitec-scada .ciclo-wrapper {
+  position: relative;
+  width: 280px;
+  height: 280px;
+  margin: 20px auto;
+  border-radius: 50%;
+  background: radial-gradient(circle, #1a1a1a 35%, #000 65%);
+  border: 1px solid #222;
+}
+
+.omnitec-scada .nodo {
+  position: absolute;
+  width: 70px;
+  height: 70px;
+  background: #080808;
+  border: 2px solid #333;
+  border-radius: 50%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 5;
+  transition: 0.3s;
+}
+
+.omnitec-scada .n0 {
+  top: -5px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+.omnitec-scada .n1 {
+  top: 50%;
+  right: -5px;
+  transform: translateY(-50%);
+}
+.omnitec-scada .n2 {
+  bottom: -5px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+.omnitec-scada .n3 {
+  top: 50%;
+  left: -5px;
+  transform: translateY(-50%);
+}
+
+.omnitec-scada .nodo.activo {
+  border-color: var(--azul);
+  box-shadow: 0 0 20px var(--azul);
+}
+
+.omnitec-scada .nodo span {
+  font-size: 0.45rem;
+  font-weight: 900;
+  color: #555;
+  text-align: center;
+  line-height: 1.1;
+}
+
+.omnitec-scada .nodo.activo span {
+  color: white;
+}
+
+.omnitec-scada .flechas-svg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.omnitec-scada .path-bg {
+  fill: none;
+  stroke: #222;
+  stroke-width: 5;
+  stroke-linecap: round;
+}
+
+.omnitec-scada .path-prog {
+  fill: none;
+  stroke-width: 7;
+  stroke-linecap: round;
+  stroke-dasharray: 100;
+  stroke-dashoffset: 100;
+  transition: stroke-dashoffset 0.5s linear;
+}
+
+.omnitec-scada #prog0 {
+  stroke: var(--verde);
+}
+.omnitec-scada #prog1,
+.omnitec-scada #prog2,
+.omnitec-scada #prog3 {
+  stroke: var(--azul);
+}
+
+.omnitec-scada .input-group label {
+  display: block;
+  font-size: 0.65rem;
+  color: var(--azul);
+  margin-bottom: 5px;
+  font-weight: bold;
+  border-left: 2px solid var(--azul);
+  padding-left: 5px;
+}
+
+.omnitec-scada input,
+.omnitec-scada select {
+  width: 100%;
+  padding: 14px;
+  background: #000;
+  border: 1px solid #333;
+  border-radius: 12px;
+  color: var(--ambar);
+  font-size: 1.2rem;
+  text-align: center;
+  box-sizing: border-box;
+  margin-bottom: 10px;
+}
+
+.omnitec-scada input::placeholder {
+  color: #444;
+  opacity: 1;
+  font-weight: normal;
+}
+
+.omnitec-scada .teclado {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.omnitec-scada .tecla {
+  padding: 15px;
+  background: #222;
+  border: 1px solid #333;
+  color: white;
+  border-radius: 10px;
+  font-size: 1.4rem;
+  font-weight: bold;
+  cursor: pointer;
+}
+
+.omnitec-scada .boton {
+  width: 100%;
+  padding: 16px;
+  border: none;
+  border-radius: 12px;
+  font-weight: bold;
+  font-size: 0.9rem;
+  margin-top: 10px;
+  cursor: pointer;
+}
+
+.omnitec-scada .btn-azul {
+  background: var(--azul);
+  color: white;
+}
+
+.omnitec-scada .btn-gris {
+  background: transparent;
+  border: 1px solid #444;
+  color: #888;
+}
+
+.omnitec-scada .acordeon-btn {
+  padding: 15px;
+  width: 100%;
+  background: #222;
+  border: none;
+  color: var(--azul);
+  font-weight: bold;
+  display: flex;
+  justify-content: space-between;
+  cursor: pointer;
+  border-radius: 10px;
+}
+
+.omnitec-scada .acordeon-content {
+  padding: 0 15px;
+  max-height: 0;
+  transition: 0.3s;
+  background: #111;
+  overflow: hidden;
+}
+
+.omnitec-scada .stat-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid #222;
+  font-size: 0.8rem;
+}
+
+.omnitec-scada h2 {
+  font-size: 0.8rem;
+  color: var(--ambar);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin: 0 0 15px 0;
+  border-bottom: 1px solid #333;
+  padding-bottom: 5px;
+  font-weight: 900;
+}
+
+.omnitec-scada #alerta-overlay,
+.omnitec-scada #wifi-overlay,
+.omnitec-scada #auth-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.95);
+  z-index: 20000;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  backdrop-filter: blur(5px);
+}
+
+.omnitec-scada #auth-overlay {
+  display: flex;
+  z-index: 30000;
+  background: #050505;
+}
+
+.omnitec-scada #auth-overlay.hidden {
+  display: none;
+}
+
+.omnitec-scada #wifi-overlay.open,
+.omnitec-scada #alerta-overlay.open {
+  display: flex;
+}
+
+.omnitec-scada .icono-alerta {
+  font-size: 3rem;
+  margin-bottom: 15px;
+  animation: omnitec-parpadeo 1s infinite;
+}
+
+.omnitec-scada .btn-mante {
+  background: var(--ambar);
+  color: black;
+  font-weight: 900;
+  box-shadow: 0 0 20px rgba(255, 191, 0, 0.4);
+}
+
+@keyframes omnitec-parpadeo {
+  0% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+.omnitec-scada #btn-mute-web {
   position: fixed;
   bottom: 120px;
   right: 20px;
@@ -216,393 +565,8 @@
   justify-content: center;
 }
 
-.btnMuteWeb:hover {
+.omnitec-scada #btn-mute-web:hover {
   opacity: 0.9;
   border-color: var(--azul);
-  color: white;
-}
-
-.contenedor {
-  max-width: 500px;
-  margin: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-}
-
-.tarjeta {
-  background: var(--tarjeta);
-  padding: 20px;
-  border-radius: 20px;
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.8);
-  position: relative;
-}
-
-.btnAnimacionPro {
-  background: #000;
-  border: 2px solid var(--azul);
-  color: white;
-  padding: 22px;
-  border-radius: 12px;
-  font-weight: 900;
-  font-size: 1.2rem;
-  width: 100%;
-  cursor: pointer;
-  text-transform: uppercase;
-  letter-spacing: 4px;
-  box-shadow: 0 0 20px rgba(0, 136, 255, 0.3);
-  transition: 0.3s;
-  margin-bottom: 15px;
-}
-
-.btnAnimacionPro:hover {
-  border-color: var(--verde);
-  box-shadow: 0 0 35px var(--verde);
-  background: #050505;
-}
-
-.statusHeader {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 10px;
-}
-
-.badgeOnline {
-  padding: 6px 12px;
-  border-radius: 50px;
-  border: 1px solid var(--verde);
-  color: var(--verde);
-  font-size: 0.65rem;
-  font-weight: 900;
-  background: rgba(0, 255, 102, 0.05);
-}
-
-.relojBig {
-  font-family: monospace;
-  font-size: 2.2rem;
-  color: var(--verde);
-  font-weight: bold;
-  text-align: center;
-}
-
-.estadoCentro {
-  font-size: 0.65rem;
-  font-weight: bold;
-  color: var(--azul);
-  text-transform: uppercase;
-  margin-top: 5px;
-  text-align: center;
-}
-
-.cicloWrap {
-  position: relative;
-  width: 280px;
-  height: 280px;
-  margin: 20px auto;
-  border-radius: 50%;
-  background: radial-gradient(circle, #1a1a1a 35%, #000 65%);
-  border: 1px solid #222;
-}
-
-.nodo {
-  position: absolute;
-  width: 70px;
-  height: 70px;
-  background: #080808;
-  border: 2px solid #333;
-  border-radius: 50%;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  z-index: 5;
-  transition: 0.3s;
-}
-
-.n0 {
-  top: -5px;
-  left: 50%;
-  transform: translateX(-50%);
-}
-.n1 {
-  top: 50%;
-  right: -5px;
-  transform: translateY(-50%);
-}
-.n2 {
-  bottom: -5px;
-  left: 50%;
-  transform: translateX(-50%);
-}
-.n3 {
-  top: 50%;
-  left: -5px;
-  transform: translateY(-50%);
-}
-
-.nodoActivo {
-  border-color: var(--azul);
-  box-shadow: 0 0 20px var(--azul);
-}
-
-.nodo span {
-  font-size: 0.45rem;
-  font-weight: 900;
-  color: #555;
-  text-align: center;
-  line-height: 1.1;
-}
-
-.nodoActivo span {
-  color: white;
-}
-
-.flechasSvg {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-  z-index: 1;
-}
-
-.pathBg {
-  fill: none;
-  stroke: #222;
-  stroke-width: 5;
-  stroke-linecap: round;
-}
-
-.pathProg {
-  fill: none;
-  stroke-width: 7;
-  stroke-linecap: round;
-  stroke-dasharray: 100;
-  stroke-dashoffset: 100;
-  transition: stroke-dashoffset 0.5s linear;
-}
-
-.prog0 {
-  stroke: var(--verde);
-}
-.prog1,
-.prog2,
-.prog3 {
-  stroke: var(--azul);
-}
-
-.inputGroup label {
-  display: block;
-  font-size: 0.65rem;
-  color: var(--azul);
-  margin-bottom: 5px;
-  font-weight: bold;
-  border-left: 2px solid var(--azul);
-  padding-left: 5px;
-}
-
-.inputGroup input {
-  width: 100%;
-  padding: 14px;
-  background: #000;
-  border: 1px solid #333;
-  border-radius: 12px;
-  color: var(--ambar);
-  font-size: 1.2rem;
-  text-align: center;
-  box-sizing: border-box;
-}
-
-.inputGroup input::placeholder {
-  color: #444;
-  opacity: 1;
-  font-weight: normal;
-}
-
-.teclado {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 10px;
-}
-
-.tecla {
-  padding: 15px;
-  background: #222;
-  border: 1px solid #333;
-  color: white;
-  border-radius: 10px;
-  font-size: 1.4rem;
-  font-weight: bold;
-  cursor: pointer;
-}
-
-.boton {
-  width: 100%;
-  padding: 16px;
-  border: none;
-  border-radius: 12px;
-  font-weight: bold;
-  font-size: 0.9rem;
-  margin-top: 10px;
-  cursor: pointer;
-}
-
-.btnAzul {
-  background: var(--azul);
-  color: white;
-}
-
-.btnGris {
-  background: transparent;
-  border: 1px solid #444;
-  color: #888;
-}
-
-.acordeonBtn {
-  padding: 15px;
-  width: 100%;
-  background: #222;
-  border: none;
-  color: var(--azul);
-  font-weight: bold;
-  display: flex;
-  justify-content: space-between;
-  cursor: pointer;
-  border-radius: 10px;
-}
-
-.acordeonContent {
-  padding: 0 15px;
-  max-height: 0;
-  transition: 0.3s;
-  background: #111;
-  overflow: hidden;
-}
-
-.acordeonOpen {
-  max-height: 800px;
-}
-
-.statRow {
-  display: flex;
-  justify-content: space-between;
-  padding: 10px 0;
-  border-bottom: 1px solid #222;
-  font-size: 0.8rem;
-}
-
-.h2 {
-  font-size: 0.8rem;
-  color: var(--ambar);
-  text-transform: uppercase;
-  letter-spacing: 1px;
-  margin: 0 0 15px 0;
-  border-bottom: 1px solid #333;
-  padding-bottom: 5px;
-  font-weight: 900;
-}
-
-.alertaOverlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  background: rgba(0, 0, 0, 0.95);
-  z-index: 20000;
-  display: none;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  backdrop-filter: blur(5px);
-}
-
-.alertaOverlayOpen {
-  display: flex;
-}
-
-.iconoAlerta {
-  font-size: 3rem;
-  margin-bottom: 15px;
-  animation: parpadeo 1s infinite;
-}
-
-.btnMante {
-  background: var(--ambar);
-  color: black;
-  font-weight: 900;
-  box-shadow: 0 0 20px rgba(255, 191, 0, 0.4);
-}
-
-@keyframes parpadeo {
-  0% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.5;
-  }
-  100% {
-    opacity: 1;
-  }
-}
-
-.grid2 {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-
-.grid2mb {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  margin-bottom: 10px;
-}
-
-.log {
-  text-align: center;
-  font-size: 0.8rem;
-  color: var(--verde);
-  font-weight: bold;
-  min-height: 1em;
-}
-
-.pinDisplay {
-  font-size: 2rem;
-  letter-spacing: 15px;
-  text-align: center;
-  margin-bottom: 10px;
-  color: var(--ambar);
-}
-
-.h2muted {
-  border: none;
-  color: #888;
-  font-size: 0.75rem;
-}
-
-.remoteRow {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  margin-top: 10px;
-}
-
-.remoteBtn {
-  padding: 14px;
-  background: #1a1a1a;
-  border: 1px solid var(--azul);
-  color: var(--azul);
-  border-radius: 10px;
-  font-weight: bold;
-  cursor: pointer;
-  font-size: 0.75rem;
-}
-
-.remoteBtn:hover {
-  background: rgba(0, 136, 255, 0.15);
   color: white;
 }

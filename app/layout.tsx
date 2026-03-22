@@ -5,8 +5,8 @@ import "./globals.css";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "OMNITEC Cloud",
-  description: "OMNIPLC-X — monitoreo PLC ESP32",
+  title: "OMNITEC - SCADA",
+  description: "OMNITEC — panel SCADA",
 };
 
 export default function RootLayout({
