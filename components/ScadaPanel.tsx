@@ -9,6 +9,7 @@ import "./omnitec-scada.css";
 const MQTT_WS_URL = "wss://broker.omnitec.store";
 const cmdTopic = (unitId: string) => `omnitec/cmd/${unitId}`;
 const telemetryTopic = (unitId: string) => `omnitec/telemetry/${unitId}`;
+const ackTopic = (unitId: string) => `omnitec/ack/${unitId}`;
 
 /** Estado alineado con /status del ESP OMNITEC (WifiConfig.h) */
 export type Telemetry = {
@@ -76,6 +77,8 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   const [pin, setPin] = useState("");
   const [alertaOpen, setAlertaOpen] = useState(false);
   const [cineOpen, setCineOpen] = useState(false);
+  /** PIN enviado en telemetría (opcional, fallback local) */
+  const [rawPinFromESP, setRawPinFromESP] = useState("");
 
   const esperandoReset = useRef(false);
   const anguloTolva = useRef(0);
@@ -152,23 +155,95 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       reconnectPeriod: 3000,
       connectTimeout: 10_000,
     });
-    
+
     clientRef.current = client;
-    
+
+    const telT = telemetryTopic(unitId);
+    const ackT = ackTopic(unitId);
+
     client.on("connect", () => {
-      console.log("[MQTT] Conectado! Suscribiendo a:", telemetryTopic(unitId));
-      client.subscribe(telemetryTopic(unitId), { qos: 0 });
+      console.log("[MQTT] Conectado! Suscribiendo a:", telT, ackT);
+      client.subscribe(telT, { qos: 0 });
+      client.subscribe(ackT, { qos: 0 });
     });
-    
+
     client.on("message", (topic, buf) => {
       try {
         const raw = JSON.parse(buf.toString()) as Record<string, unknown>;
-        setTel(normalizeTelemetry(raw));
+
+        if (topic === telT) {
+          setTel(normalizeTelemetry(raw));
+          if (raw.pin != null) setRawPinFromESP(String(raw.pin));
+          return;
+        }
+
+        if (topic === ackT) {
+          const st = String(raw.status ?? "").toUpperCase();
+
+          if (st === "OK") {
+            if (authTimerRef.current) {
+              clearTimeout(authTimerRef.current);
+              authTimerRef.current = null;
+            }
+            if (pinCheckTimerRef.current) {
+              clearTimeout(pinCheckTimerRef.current);
+              pinCheckTimerRef.current = null;
+            }
+
+            if (pendingAuth.current) {
+              pendingAuth.current = false;
+              setAuthenticated(true);
+              setPinLogin("");
+              setLoginError("");
+            }
+
+            if (pendingPinCheck.current) {
+              pendingPinCheck.current = false;
+              const bloqueo = document.getElementById("panel-bloqueo");
+              const edicion = document.getElementById("panel-edicion");
+              if (bloqueo) bloqueo.style.display = "none";
+              if (edicion) edicion.style.display = "block";
+              setPin("");
+            }
+            return;
+          }
+
+          if (st === "ERROR") {
+            if (authTimerRef.current) {
+              clearTimeout(authTimerRef.current);
+              authTimerRef.current = null;
+            }
+            if (pinCheckTimerRef.current) {
+              clearTimeout(pinCheckTimerRef.current);
+              pinCheckTimerRef.current = null;
+            }
+
+            const errMsg =
+              typeof raw.message === "string" && raw.message.trim()
+                ? raw.message
+                : "PIN INCORRECTO";
+
+            if (pendingAuth.current) {
+              pendingAuth.current = false;
+              setLoginError(errMsg);
+              setPinLogin("");
+              const el = document.getElementById("login-pin-display");
+              if (el) el.innerText = "____";
+            }
+
+            if (pendingPinCheck.current) {
+              pendingPinCheck.current = false;
+              setPin("");
+              showLog(errMsg, "var(--rojo)");
+            }
+            return;
+          }
+        }
       } catch {
-        // ignore
+        /* ignore */
       }
     });
-    
+
     return () => {
       client.end(true);
       clientRef.current = null;
@@ -198,18 +273,6 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       setPin("");
     }
   }, [tel, pinLogin, pin]);
-
-  // Hack para extraer el PIN directamente si viene en la telemetría (como hicimos en el ESP32)
-  const [rawPinFromESP, setRawPinFromESP] = useState<string>("");
-  useEffect(() => {
-     clientRef.current?.on("message", (t, b) => {
-        try {
-            const data = JSON.parse(b.toString());
-            if (data.pin) setRawPinFromESP(data.pin);
-        } catch(e){}
-     });
-  }, []);
-
 
   useEffect(() => {
     return () => {
