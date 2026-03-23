@@ -674,7 +674,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
             ACCESO OMNITEC
           </h2>
           <p style={{ color: "#888", fontSize: "0.8rem", marginBottom: 20 }}>
-            Ingrese PIN de 4 dígitos para controlar unidad
+            INGRESE PIN DE ACCESO
           </p>
           <div
             id="login-pin-display"
@@ -961,7 +961,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         </div>
 
         <div className="tarjeta">
-          <h2>CONFIGURAR TIEMPOS (S)</h2>
+          <h2>CONFIGURAR TIEMPOS (SEG)</h2>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
             <div className="input-group">
               <label htmlFor="in-cs">COMPUERTA SUB</label>
