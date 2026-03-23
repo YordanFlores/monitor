@@ -406,7 +406,8 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     }
 
     pendingAuth.current = true;
-    
+    publishCmd({ authLogin: pinLogin, checkPin: pinLogin });
+
     authTimerRef.current = setTimeout(() => {
       if (pendingAuth.current) {
         pendingAuth.current = false;
@@ -484,7 +485,8 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     }
 
     pendingPinCheck.current = true;
-    
+    publishCmd({ checkPin: pin });
+
     pinCheckTimerRef.current = setTimeout(() => {
       if (pendingPinCheck.current) {
         pendingPinCheck.current = false;
