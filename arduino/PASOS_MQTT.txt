@@ -1,0 +1,15 @@
+OMNIPRO.ino — el cambio de modo por MQTT no funciona hasta integrar los comandos.
+
+1) Copia el cuerpo de aplicarComandoMqtt desde omnipro_mqtt_callback.cpp (bloque sin comentarios /* */).
+
+2) En mqttCallback, después de procesar checkPin, llama:
+     aplicarComandoMqtt(doc.as<JsonObject>());
+   (ArduinoJson 6: doc es StaticJsonDocument, usar doc.as<JsonObject>().)
+
+3) Pega aplicarComandoMqtt en un archivo .h del sketch o al final del .ino ANTES de mqttCallback,
+   o incluye omnipro_mqtt_callback.cpp renombrando la función a no comentada.
+
+4) Orden en aplicarComandoMqtt: primero setT (cs/cb/ts/tb), luego setMode/modoPLC/m solo 0|1 sin "c",
+   después setMante (c + m horas), etc. Ver omnipro_mqtt_callback.cpp actualizado.
+
+5) mqttPayloadSetMode en la web envía: m, setMode, modoPLC (lib/plc-mqtt.ts).

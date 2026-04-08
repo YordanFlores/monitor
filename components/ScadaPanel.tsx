@@ -1,34 +1,90 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 import mqtt, { type MqttClient } from "mqtt";
+import { drawActividadDiariaChart } from "@/lib/chart-actividad";
+import {
+  buildCajaDayBlocks,
+  buildChartPointsFromCsv,
+  getColorForEvent,
+  groupLogsByDay,
+  parseLogLine,
+  type LogsByDay,
+} from "@/lib/caja-negra";
+import { type PlcConfigJson, fetchPlcConfig, getEspOrigin, getPlcConfigOrigin } from "@/lib/esp-api";
+import {
+  mqttPayloadApagadoMin,
+  mqttPayloadIdentidad,
+  mqttPayloadMantePin,
+  mqttPayloadNewOperPin,
+  mqttPayloadResetMante,
+  mqttPayloadSetMante,
+  mqttPayloadSetMode,
+  mqttPayloadSetT,
+  mqttPayloadSnoozeMante,
+} from "@/lib/plc-mqtt";
 import "./omnitec-scada.css";
 
-// --- CONFIGURACIÓN MQTT LOCAL (UBUNTU) ---
-// Cambia la IP local por tu nuevo subdominio con seguridad SSL (wss)
-const MQTT_WS_URL = "wss://broker.omnitec.store";
-const cmdTopic = (unitId: string) => `omnitec/cmd/${unitId}`;
-const telemetryTopic = (unitId: string) => `omnitec/telemetry/${unitId}`;
-const ackTopic = (unitId: string) => `omnitec/ack/${unitId}`;
+/** wss://broker… vía Nginx → Mosquitto (MQTT sobre WebSocket). Ruta opcional con NEXT_PUBLIC_MQTT_WS_PATH=/mqtt */
+function buildMqttWebSocketUrl(): string {
+  const base =
+    typeof process !== "undefined" && process.env.NEXT_PUBLIC_MQTT_WS_URL?.trim()
+      ? process.env.NEXT_PUBLIC_MQTT_WS_URL.trim()
+      : "wss://broker.omnitec.store";
+  const extraPath =
+    typeof process !== "undefined" ? process.env.NEXT_PUBLIC_MQTT_WS_PATH?.trim() ?? "" : "";
+  if (!extraPath) return base;
+  try {
+    const u = new URL(base);
+    if (u.pathname && u.pathname !== "/") return base;
+    u.pathname = extraPath.startsWith("/") ? extraPath : `/${extraPath}`;
+    return u.toString();
+  } catch {
+    return base;
+  }
+}
 
-/** Estado alineado con /status del ESP OMNITEC (WifiConfig.h) */
+const cmdTopic = (id: string) => `omnitec/cmd/${id}`;
+const telemetryTopic = (id: string) => `omnitec/telemetry/${id}`;
+const ackTopic = (id: string) => `omnitec/ack/${id}`;
+
+/**
+ * Telemetría omnitec/telemetry/{unitId} (JSON). Núcleo mínimo + campos opcionales
+ * (tCS… prog, net, authOk) si el firmware los publica.
+ */
 export type Telemetry = {
-  fase: number;
-  prog: number;
+  plcM: boolean;
   ms: number;
-  tCS: number;
-  tCB: number;
-  tTS: number;
-  tTB: number;
+  rout: number;
+  step: number;
+  col: number;
   relays: number;
+  fase: number;
   ciclos: number;
   uso: number;
-  limC: number;
-  limM: number;
-  net: boolean;
   alerta: boolean;
-  pinCheckOk?: boolean;
+  prog?: number;
+  /** Duraciones en ms (solo si el JSON las incluye; si no, no forzar 0). */
+  tCS?: number;
+  tCB?: number;
+  tTS?: number;
+  tTB?: number;
+  /** Alternativa: segundos en telemetría (cs/cb/ts/tb). */
+  cs?: number;
+  cb?: number;
+  ts?: number;
+  tb?: number;
+  limC?: number;
+  limM?: number;
+  net?: boolean;
+  silenciada?: boolean;
+  pin?: string;
   authOk?: boolean;
+  pinCheckOk?: boolean;
+  deviceId?: string;
+  /** Últimas líneas de caja negra (mismo formato que WebUI), enviadas por MQTT en telemetría (`cn`). */
+  cn?: string[];
 };
 
 const VEL_7S = 0.64;
@@ -45,28 +101,242 @@ function asBool(v: unknown): boolean {
   return v === true || v === "true" || v === 1 || String(v).toLowerCase() === "true";
 }
 
-function normalizeTelemetry(raw: Record<string, unknown>): Telemetry {
+/** Compatible con firmwares que usan distintos nombres (ver README). */
+function telemetryAuthOk(raw: Record<string, unknown>): boolean {
+  return (
+    asBool(raw.authOk) ||
+    asBool(raw.loginOk) ||
+    asBool(raw.sessionOk) ||
+    asBool(raw.authLoginOk) ||
+    asBool(raw.pinOk) ||
+    asBool(raw.configUnlocked) ||
+    String(raw.authResult ?? "").toUpperCase() === "OK" ||
+    String(raw.loginResult ?? "").toUpperCase() === "OK"
+  );
+}
+
+function telemetryPinCheckOk(raw: Record<string, unknown>): boolean {
+  return (
+    asBool(raw.pinCheckOk) ||
+    asBool(raw.configUnlocked) ||
+    String(raw.pinCheck ?? "").toLowerCase() === "ok"
+  );
+}
+
+/** ID en telemetría: nombres habituales en firmware OMNITEC. */
+function pickDeviceId(raw: Record<string, unknown>): string | null {
+  const v = raw.id ?? raw.idUnidad ?? raw.unitId ?? raw.deviceId ?? raw.nombreUnidad;
+  if (v == null) return null;
+  const s = String(v).trim();
+  return s.length > 0 ? s : null;
+}
+
+/** Solo si la clave existe en el JSON (evita confundir ausencia con 0). */
+function optNum(raw: Record<string, unknown>, key: string): number | undefined {
+  if (!(key in raw) || raw[key] === undefined || raw[key] === null) return undefined;
+  const n = Number(raw[key]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** Igual que el HTML del ESP: valor escrito o, si está vacío, el placeholder (s). */
+function readSecFromInputOrPh(id: string, placeholderSec: string): number {
+  if (typeof document === "undefined") return NaN;
+  const el = document.getElementById(id) as HTMLInputElement | null;
+  const raw = el?.value?.trim() ?? "";
+  if (raw !== "") {
+    const n = Number(raw.replace(",", "."));
+    return Number.isFinite(n) ? n : NaN;
+  }
+  const p = placeholderSec.trim();
+  if (p !== "" && p !== "—") {
+    const n = Number(p.replace(",", "."));
+    return Number.isFinite(n) ? n : NaN;
+  }
+  return NaN;
+}
+
+function readStrFromInputOrPh(id: string, ph: string): string {
+  if (typeof document === "undefined") return "";
+  const el = document.getElementById(id) as HTMLInputElement | null;
+  const raw = el?.value?.trim() ?? "";
+  if (raw !== "") return raw;
+  return ph.trim();
+}
+
+function parseCnTelemetry(raw: Record<string, unknown>): string[] | undefined {
+  const v = raw.cn;
+  if (!Array.isArray(v)) return undefined;
+  const out: string[] = [];
+  for (const x of v) {
+    if (typeof x === "string" && x.trim()) out.push(x.trim());
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function normalizeLiveTelemetry(raw: Record<string, unknown>): Telemetry {
+  const deviceId = pickDeviceId(raw) ?? undefined;
+  const pin = raw.pin != null ? String(raw.pin) : undefined;
+  const progN = num(raw.prog, NaN);
   return {
-    fase: num(raw.fase),
-    prog: num(raw.prog),
+    plcM: asBool(raw.plcM),
     ms: num(raw.ms),
-    tCS: num(raw.tCS),
-    tCB: num(raw.tCB),
-    tTS: num(raw.tTS),
-    tTB: num(raw.tTB),
+    rout: num(raw.rout),
+    step: num(raw.step),
+    col: num(raw.col),
     relays: num(raw.relays),
+    fase: num(raw.fase),
     ciclos: num(raw.ciclos),
     uso: num(raw.uso),
-    limC: num(raw.limC),
-    limM: num(raw.limM),
-    net: asBool(raw.net),
     alerta: asBool(raw.alerta),
-    pinCheckOk: asBool(raw.pinCheckOk) || String(raw.pinCheck ?? "").toLowerCase() === "ok",
-    authOk: asBool(raw.authOk) || String(raw.authResult ?? "").toUpperCase() === "OK",
+    prog: Number.isFinite(progN) ? progN : undefined,
+    tCS: optNum(raw, "tCS"),
+    tCB: optNum(raw, "tCB"),
+    tTS: optNum(raw, "tTS"),
+    tTB: optNum(raw, "tTB"),
+    cs: optNum(raw, "cs"),
+    cb: optNum(raw, "cb"),
+    ts: optNum(raw, "ts"),
+    tb: optNum(raw, "tb"),
+    limC: optNum(raw, "limC"),
+    limM: optNum(raw, "limM"),
+    net: raw.net !== undefined ? asBool(raw.net) : undefined,
+    silenciada: raw.silenciada !== undefined ? asBool(raw.silenciada) : undefined,
+    pin,
+    pinCheckOk: telemetryPinCheckOk(raw),
+    authOk: telemetryAuthOk(raw),
+    deviceId,
+    cn: parseCnTelemetry(raw),
   };
 }
 
+function msFromTelOrCfg(
+  tel: Telemetry,
+  ms: keyof Pick<Telemetry, "tCS" | "tCB" | "tTS" | "tTB">,
+  sec: keyof Pick<Telemetry, "cs" | "cb" | "ts" | "tb">,
+  cfgSec: number,
+): number {
+  const v = tel[ms];
+  if (v != null && Number.isFinite(v)) return Math.max(0, v);
+  const s = tel[sec];
+  if (s != null && Number.isFinite(s)) return Math.max(0, s) * 1000;
+  return Math.max(0, cfgSec) * 1000;
+}
+
+function gateTolvaMs(cfg: PlcConfigJson | null, tel: Telemetry | null) {
+  if (tel) {
+    const hasAnyTel =
+      tel.tCS != null ||
+      tel.tCB != null ||
+      tel.tTS != null ||
+      tel.tTB != null ||
+      tel.cs != null ||
+      tel.cb != null ||
+      tel.ts != null ||
+      tel.tb != null;
+    if (hasAnyTel || cfg) {
+      const c = cfg;
+      return {
+        tCS: msFromTelOrCfg(tel, "tCS", "cs", c?.cs ?? 0),
+        tCB: msFromTelOrCfg(tel, "tCB", "cb", c?.cb ?? 0),
+        tTS: msFromTelOrCfg(tel, "tTS", "ts", c?.ts ?? 0),
+        tTB: msFromTelOrCfg(tel, "tTB", "tb", c?.tb ?? 0),
+      };
+    }
+  }
+  if (cfg) {
+    return {
+      tCS: Math.max(0, cfg.cs) * 1000,
+      tCB: Math.max(0, cfg.cb) * 1000,
+      tTS: Math.max(0, cfg.ts) * 1000,
+      tTB: Math.max(0, cfg.tb) * 1000,
+    };
+  }
+  return { tCS: 0, tCB: 0, tTS: 0, tTB: 0 };
+}
+
+/** Duración de la fase actual en ms (orden igual que configPhaseMs: CS, TS, TB, CB). */
+function phaseDurationMsNow(t: Telemetry, cfg: PlcConfigJson | null): number {
+  const gt = gateTolvaMs(cfg, t);
+  const byFase = [gt.tCS, gt.tTS, gt.tTB, gt.tCB];
+  return byFase[t.fase] ?? 0;
+}
+
+/** Progreso 0–100: telemetría `prog` o estimación desde ms y tiempos (MQTT o /api/config). */
+function computePhaseProg(t: Telemetry, cfg: PlcConfigJson | null): number {
+  if (typeof t.prog === "number" && Number.isFinite(t.prog)) {
+    return Math.min(100, Math.max(0, t.prog));
+  }
+  const dur = phaseDurationMsNow(t, cfg);
+  if (dur <= 0) return 0;
+  return Math.min(100, (t.ms / dur) * 100);
+}
+
+/** ACK omnitec/ack/{unitId} — JSON o texto plano. */
+function parseMqttAck(buf: Buffer): { ok: true } | { ok: false; message: string } | null {
+  const t = buf.toString().trim();
+  if (!t) return null;
+  if (/^OK$/i.test(t)) return { ok: true };
+  const errPlain = t.match(/^ERROR\s*(.*)$/i);
+  if (errPlain) {
+    return { ok: false, message: errPlain[1]?.trim() || "PIN INCORRECTO" };
+  }
+  try {
+    const raw = JSON.parse(t) as Record<string, unknown>;
+    const st = String(raw.status ?? raw.result ?? "").toUpperCase();
+    const msg =
+      typeof raw.message === "string" && raw.message.trim()
+        ? raw.message.trim()
+        : "PIN INCORRECTO";
+    if (st === "OK" || raw.success === true || telemetryAuthOk(raw)) return { ok: true };
+    if (st === "ERROR" || raw.success === false) return { ok: false, message: msg };
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/** Telemetría: JSON directo, o string JSON anidado, o `{ data: "..." }`. */
+function parseTelemetryJson(buf: Buffer): Record<string, unknown> | null {
+  const t = buf.toString().trim();
+  if (!t) return null;
+  try {
+    const raw: unknown = JSON.parse(t);
+    if (typeof raw === "string") {
+      try {
+        const inner = JSON.parse(raw) as unknown;
+        if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+          return inner as Record<string, unknown>;
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    }
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      const o = raw as Record<string, unknown>;
+      if (typeof o.data === "string") {
+        try {
+          const inner = JSON.parse(o.data) as unknown;
+          if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+            return inner as Record<string, unknown>;
+          }
+        } catch {
+          /* usar objeto raíz */
+        }
+      }
+      return o;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export function ScadaPanel({ unitId }: { unitId: string }) {
+  const router = useRouter();
+  /** Tópicos MQTT: se actualiza con la URL y con el ID que manda el PLC en telemetría. */
+  const [mqttUnitId, setMqttUnitId] = useState(unitId);
+
   const [tel, setTel] = useState<Telemetry | null>(null);
   const [authenticated, setAuthenticated] = useState(SKIP_LOGIN);
   const [wifiOpen, setWifiOpen] = useState(false);
@@ -76,7 +346,28 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   const [loginError, setLoginError] = useState("");
   const [pin, setPin] = useState("");
   const [alertaOpen, setAlertaOpen] = useState(false);
+  const [manteAuthOpen, setManteAuthOpen] = useState(false);
+  const [pinMante, setPinMante] = useState("");
+  const [mqttConnected, setMqttConnected] = useState(false);
   const [cineOpen, setCineOpen] = useState(false);
+  const [otaOpen, setOtaOpen] = useState(false);
+  const [chartOpen, setChartOpen] = useState(false);
+  const [downloadOpen, setDownloadOpen] = useState(false);
+  const [rtcOpen, setRtcOpen] = useState(false);
+  const [cajaOpen, setCajaOpen] = useState(false);
+  const [plcEditorOpen, setPlcEditorOpen] = useState(false);
+  const [cajaGrouped, setCajaGrouped] = useState<LogsByDay | null>(null);
+  const [cajaLoading, setCajaLoading] = useState(false);
+  const [dlTipo, setDlTipo] = useState<"todo" | "rango">("todo");
+  const [dlDesde, setDlDesde] = useState("");
+  const [dlHasta, setDlHasta] = useState("");
+  const [cajaDayOpen, setCajaDayOpen] = useState<Record<string, boolean>>({});
+  const chartCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const cajaBlocks = useMemo(() => {
+    if (!cajaGrouped || Object.keys(cajaGrouped).length === 0) return [];
+    return buildCajaDayBlocks(cajaGrouped);
+  }, [cajaGrouped]);
   /** PIN enviado en telemetría (opcional, fallback local) */
   const [rawPinFromESP, setRawPinFromESP] = useState("");
 
@@ -87,28 +378,71 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   const isOperating = useRef(false);
   const clientRef = useRef<MqttClient | null>(null);
   const historialPanelRef = useRef<HTMLDivElement>(null);
-  const pendingPinCheck = useRef(false);
   const pendingAuth = useRef(false);
-  const pinCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingPinCheck = useRef(false);
   const authTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pinCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const publishCmd = useCallback((payload: Record<string, unknown>) => {
-    const c = clientRef.current;
-    if (!c?.connected) {
-        console.warn("[MQTT] No conectado, comando no enviado:", payload);
-        return;
-    }
-    console.log(`[MQTT] Publicando a ${cmdTopic(unitId)}:`, payload);
-    c.publish(cmdTopic(unitId), JSON.stringify(payload), { qos: 0 });
+  /** Origen HTTP para GET /api/config (CONFIG_ORIGIN o ESP_ORIGIN). */
+  const configOrigin = useMemo(() => getPlcConfigOrigin(), []);
+  /** Origen del AP del equipo (OTA, logs, lógica) — mismo host que el ESP en LAN. */
+  const espLanOrigin = useMemo(() => getEspOrigin(), []);
+  const [plcConfig, setPlcConfig] = useState<PlcConfigJson | null>(null);
+  const telRef = useRef<Telemetry | null>(null);
+
+  const publishCmd = useCallback(
+    (payload: Record<string, unknown>): boolean => {
+      const c = clientRef.current;
+      if (!c?.connected) {
+        console.warn("[MQTT] No conectado al broker, comando no enviado:", payload);
+        return false;
+      }
+      const topic = cmdTopic(mqttUnitId);
+      c.publish(topic, JSON.stringify(payload), { qos: 0 });
+      return true;
+    },
+    [mqttUnitId],
+  );
+
+  useEffect(() => {
+    telRef.current = tel;
+  }, [tel]);
+
+  /** Caja negra vía MQTT (`cn` en telemetría): no depende de /api/logs ni CORS. */
+  useEffect(() => {
+    const lines = tel?.cn;
+    if (!lines?.length) return;
+    setCajaGrouped(groupLogsByDay(lines.join("\n")));
+  }, [tel]);
+
+  useEffect(() => {
+    setMqttUnitId(unitId);
   }, [unitId]);
 
-  const showLog = useCallback((m: string, c: string) => {
-    const e = document.getElementById("log");
-    if (e) {
-      e.innerText = m;
-      (e as HTMLElement).style.color = c;
-      setTimeout(() => { e.innerText = ""; }, 3000);
+  useEffect(() => {
+    if (mqttUnitId !== unitId) {
+      router.replace(`/unit/${encodeURIComponent(mqttUnitId)}/scada`);
     }
+  }, [mqttUnitId, unitId, router]);
+
+  /** Misma lógica que WifiConfig.h: icono + borde/sombra según color, clase .show 2500ms */
+  const showLog = useCallback((m: string, c: string) => {
+    const t = document.getElementById("toast-overlay");
+    if (!t) return;
+    let icon = "✅";
+    if (c.includes("rojo") || c.includes("ff4444")) icon = "❌";
+    if (c.includes("ambar") || c.includes("FFBF00")) icon = "⚠️";
+    t.innerHTML = `<div style="font-size: 2.5rem; margin-bottom: 10px;">${icon}</div>${m}`;
+    const el = t as HTMLElement;
+    el.style.borderColor = c;
+    el.style.boxShadow = `0 15px 35px rgba(0,0,0,0.8), 0 0 25px ${c} inset`;
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    t.classList.add("show");
+    toastTimerRef.current = setTimeout(() => {
+      t.classList.remove("show");
+      toastTimerRef.current = null;
+    }, 2500);
   }, []);
 
   const refreshP = useCallback(() => {
@@ -147,137 +481,160 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     return () => document.body.removeEventListener("click", initAudio);
   }, [initAudio]);
 
+  /** MQTT (WebSocket seguro): telemetría + ACK en tópicos separados (Mosquitto vía Nginx). */
   useEffect(() => {
-    console.log("[MQTT] Conectando a", MQTT_WS_URL);
-    const client = mqtt.connect(MQTT_WS_URL, {
+    const wsUrl = buildMqttWebSocketUrl();
+    console.log("[MQTT] Conectando a", wsUrl);
+    const client = mqtt.connect(wsUrl, {
       protocolVersion: 4,
       clientId: `omnitec-web-${Math.random().toString(16).slice(2)}`,
       reconnectPeriod: 3000,
       connectTimeout: 10_000,
     });
-
     clientRef.current = client;
 
-    const telT = telemetryTopic(unitId);
-    const ackT = ackTopic(unitId);
+    const telT = telemetryTopic(mqttUnitId);
+    const ackT = ackTopic(mqttUnitId);
 
-    client.on("connect", () => {
-      console.log("[MQTT] Conectado! Suscribiendo a:", telT, ackT);
+    const clearTimers = () => {
+      if (authTimerRef.current) {
+        clearTimeout(authTimerRef.current);
+        authTimerRef.current = null;
+      }
+      if (pinCheckTimerRef.current) {
+        clearTimeout(pinCheckTimerRef.current);
+        pinCheckTimerRef.current = null;
+      }
+    };
+
+    const applyAckOk = () => {
+      clearTimers();
+      if (pendingAuth.current) {
+        pendingAuth.current = false;
+        setAuthenticated(true);
+        setPinLogin("");
+        setLoginError("");
+      }
+      if (pendingPinCheck.current) {
+        pendingPinCheck.current = false;
+        const bloqueo = document.getElementById("panel-bloqueo");
+        const edicion = document.getElementById("panel-edicion");
+        if (bloqueo) bloqueo.style.display = "none";
+        if (edicion) edicion.style.display = "block";
+        setPin("");
+      }
+    };
+
+    const applyAckErr = (errMsg: string) => {
+      clearTimers();
+      if (pendingAuth.current) {
+        pendingAuth.current = false;
+        setLoginError(errMsg);
+        setPinLogin("");
+        const el = document.getElementById("login-pin-display");
+        if (el) el.innerText = "____";
+      }
+      if (pendingPinCheck.current) {
+        pendingPinCheck.current = false;
+        setPin("");
+        showLog(errMsg, "var(--rojo)");
+      }
+    };
+
+    const onConn = () => {
+      setMqttConnected(true);
+      console.log("[MQTT] Suscrito a:", telT, ackT);
       client.subscribe(telT, { qos: 0 });
       client.subscribe(ackT, { qos: 0 });
-    });
+    };
+    client.on("connect", onConn);
+    client.on("close", () => setMqttConnected(false));
+    client.on("offline", () => setMqttConnected(false));
+    client.on("disconnect", () => setMqttConnected(false));
 
     client.on("message", (topic, buf) => {
-      try {
-        const raw = JSON.parse(buf.toString()) as Record<string, unknown>;
-
-        if (topic === telT) {
-          setTel(normalizeTelemetry(raw));
-          if (raw.pin != null) setRawPinFromESP(String(raw.pin));
+      if (topic === ackT) {
+        const parsed = parseMqttAck(buf);
+        if (!parsed) {
+          if (process.env.NODE_ENV === "development") {
+            console.warn("[MQTT] ACK no reconocido:", buf.toString().slice(0, 160));
+          }
           return;
         }
-
-        if (topic === ackT) {
-          const st = String(raw.status ?? "").toUpperCase();
-
-          if (st === "OK") {
-            if (authTimerRef.current) {
-              clearTimeout(authTimerRef.current);
-              authTimerRef.current = null;
-            }
-            if (pinCheckTimerRef.current) {
-              clearTimeout(pinCheckTimerRef.current);
-              pinCheckTimerRef.current = null;
-            }
-
-            if (pendingAuth.current) {
-              pendingAuth.current = false;
-              setAuthenticated(true);
-              setPinLogin("");
-              setLoginError("");
-            }
-
-            if (pendingPinCheck.current) {
-              pendingPinCheck.current = false;
-              const bloqueo = document.getElementById("panel-bloqueo");
-              const edicion = document.getElementById("panel-edicion");
-              if (bloqueo) bloqueo.style.display = "none";
-              if (edicion) edicion.style.display = "block";
-              setPin("");
-            }
-            return;
-          }
-
-          if (st === "ERROR") {
-            if (authTimerRef.current) {
-              clearTimeout(authTimerRef.current);
-              authTimerRef.current = null;
-            }
-            if (pinCheckTimerRef.current) {
-              clearTimeout(pinCheckTimerRef.current);
-              pinCheckTimerRef.current = null;
-            }
-
-            const errMsg =
-              typeof raw.message === "string" && raw.message.trim()
-                ? raw.message
-                : "PIN INCORRECTO";
-
-            if (pendingAuth.current) {
-              pendingAuth.current = false;
-              setLoginError(errMsg);
-              setPinLogin("");
-              const el = document.getElementById("login-pin-display");
-              if (el) el.innerText = "____";
-            }
-
-            if (pendingPinCheck.current) {
-              pendingPinCheck.current = false;
-              setPin("");
-              showLog(errMsg, "var(--rojo)");
-            }
-            return;
-          }
-        }
-      } catch {
-        /* ignore */
+        if (parsed.ok) applyAckOk();
+        else applyAckErr(parsed.message);
+        return;
       }
+
+      if (topic !== telT) return;
+
+      const raw = parseTelemetryJson(buf);
+      if (!raw) {
+        if (process.env.NODE_ENV === "development") {
+          console.warn("[MQTT] Telemetría no parseable en", telT, buf.toString().slice(0, 200));
+        }
+        return;
+      }
+      setTel(normalizeLiveTelemetry(raw));
+      if (raw.pin != null) setRawPinFromESP(String(raw.pin));
     });
 
     return () => {
+      setMqttConnected(false);
       client.end(true);
       clientRef.current = null;
     };
-  }, [unitId]);
+  }, [mqttUnitId, showLog]);
+
+  /**
+   * Tras iniciar sesión: lectura única de parámetros NV (GET /api/config).
+   * Requiere NEXT_PUBLIC_OMNITEC_CONFIG_ORIGIN o NEXT_PUBLIC_OMNITEC_ESP_ORIGIN alcanzable desde el navegador.
+   * El ID de tópicos MQTT sigue la ruta /unit/[unitId]/scada (no se sobrescribe con c.id) para no perder telemetría.
+   */
+  useEffect(() => {
+    if (!authenticated || !configOrigin) return;
+    let cancelled = false;
+    void fetchPlcConfig(configOrigin).then((c) => {
+      if (cancelled || !c) return;
+      setPlcConfig(c);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [authenticated, configOrigin]);
 
   useEffect(() => {
     const d = tel;
     if (!d) return;
-    // Si la telemetría incluye el PIN actual (como lo configuramos en el ESP32), validamos localmente.
-    // Esto es mucho más rápido y seguro que esperar una respuesta de autenticación.
     if (pendingAuth.current && (rawPinFromESP === pinLogin || d.authOk)) {
       pendingAuth.current = false;
-      if (authTimerRef.current) clearTimeout(authTimerRef.current);
+      if (authTimerRef.current) {
+        clearTimeout(authTimerRef.current);
+        authTimerRef.current = null;
+      }
       setAuthenticated(true);
       setPinLogin("");
       setLoginError("");
     }
-    
-    if (pendingPinCheck.current && rawPinFromESP === pin) {
+    if (pendingPinCheck.current && (rawPinFromESP === pin || d.pinCheckOk)) {
       pendingPinCheck.current = false;
-      if (pinCheckTimerRef.current) clearTimeout(pinCheckTimerRef.current);
+      if (pinCheckTimerRef.current) {
+        clearTimeout(pinCheckTimerRef.current);
+        pinCheckTimerRef.current = null;
+      }
       const bloqueo = document.getElementById("panel-bloqueo");
       const edicion = document.getElementById("panel-edicion");
       if (bloqueo) bloqueo.style.display = "none";
       if (edicion) edicion.style.display = "block";
       setPin("");
     }
-  }, [tel, pinLogin, pin]);
+  }, [tel, pinLogin, pin, rawPinFromESP]);
 
   useEffect(() => {
     return () => {
       if (pinCheckTimerRef.current) clearTimeout(pinCheckTimerRef.current);
       if (authTimerRef.current) clearTimeout(authTimerRef.current);
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     };
   }, []);
 
@@ -332,23 +689,55 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     const d = tel;
     if (!d || !authenticated) return;
 
-    const cron = document.getElementById("cronometro");
-    const faseTxt = document.getElementById("fase-txt");
-    if (cron) cron.innerText = `${(d.ms / 1000).toFixed(1)}s`;
-    const nombres = ["ABRIENDO COMPUERTA", "SUBIENDO TOLVA", "BAJANDO TOLVA", "CERRANDO COMPUERTA"];
-    if (faseTxt) faseTxt.innerText = d.relays === 0 ? "SISTEMA LISTO" : nombres[d.fase] ?? "—";
+    const gt = gateTolvaMs(plcConfig, d);
+    const prog =
+      typeof d.prog === "number" && Number.isFinite(d.prog)
+        ? Math.min(100, Math.max(0, d.prog))
+        : computePhaseProg(d, plcConfig);
+    const limC = plcConfig?.lc ?? d.limC;
 
-    const wBtn = document.getElementById("wifi-status-btn");
-    if (wBtn) {
-      if (d.net) {
-        wBtn.innerText = "WIFI: INTERNET";
-        wBtn.style.color = "var(--verde)";
-        wBtn.style.borderColor = "var(--verde)";
+    const cron = document.getElementById("cronometro-cls");
+    const faseTxt = document.getElementById("fase-txt");
+    const hudT = document.getElementById("hud-time-val");
+    const sec = (d.ms / 1000).toFixed(1);
+    if (cron) cron.innerText = `${sec}s`;
+    if (hudT) hudT.innerText = `${sec}s`;
+
+    const nombres = ["ABRIENDO COMPUERTA", "SUBIENDO TOLVA", "BAJANDO TOLVA", "CERRANDO COMPUERTA"];
+    if (faseTxt) {
+      if (d.plcM) {
+        faseTxt.innerText = `PLC · R${d.rout} · COL ${d.col} · PASO ${d.step + 1}`;
       } else {
-        wBtn.innerText = "WIFI: AP LOCAL";
-        wBtn.style.color = "var(--ambar)";
-        wBtn.style.borderColor = "var(--ambar)";
+        faseTxt.innerText = d.relays === 0 ? "SISTEMA LISTO v2.0" : nombres[d.fase] ?? "—";
       }
+    }
+
+    const setWifiBadge = (el: HTMLElement | null) => {
+      if (!el) return;
+      if (d.net !== undefined) {
+        if (d.net) {
+          el.innerText = "📡 WIFI: INTERNET";
+          el.style.color = "var(--verde)";
+          el.style.borderColor = "var(--verde)";
+        } else {
+          el.innerText = "📡 WIFI: AP LOCAL";
+          el.style.color = "var(--ambar)";
+          el.style.borderColor = "var(--ambar)";
+        }
+      } else {
+        el.innerText = "📡 MQTT";
+        el.style.color = "var(--ambar)";
+        el.style.borderColor = "var(--ambar)";
+      }
+    };
+    setWifiBadge(document.getElementById("wifi-status-btn"));
+    setWifiBadge(document.getElementById("wifi-status-btn-plc"));
+
+    const cronPlc = document.getElementById("cronometro-plc");
+    if (cronPlc) cronPlc.innerText = `${sec}s`;
+    const plcFase = document.getElementById("plc-fase-txt");
+    if (plcFase && d.plcM) {
+      plcFase.innerText = `PLC · R${d.rout} · COL ${d.col} · PASO ${d.step + 1}`;
     }
 
     for (let i = 0; i < 4; i++) {
@@ -357,16 +746,26 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         if ((d.relays >> i) & 1) n.classList.add("activo");
         else n.classList.remove("activo");
       }
+      const rn = document.getElementById(`rn${i}`);
+      if (rn) {
+        if ((d.relays >> i) & 1) rn.classList.add("activo");
+        else rn.classList.remove("activo");
+      }
     }
 
     const f = d.fase;
     const r = d.relays;
-    const prog = d.prog;
-    let p0 = f === 0 && r > 0 ? prog : f > 0 ? 100 : 0;
-    let p1 = f === 1 && r > 0 ? prog : f > 1 ? 100 : 0;
-    let p2 = f === 2 && r > 0 ? prog : f > 2 ? 100 : 0;
-    let p3 = f === 3 && r > 0 ? prog : f < 3 ? 0 : 100;
-    if (f === 0 && r === 0) p3 = 0;
+    let p0 = 0;
+    let p1 = 0;
+    let p2 = 0;
+    let p3 = 0;
+    if (!d.plcM) {
+      p0 = f === 0 && r > 0 ? prog : f > 0 ? 100 : 0;
+      p1 = f === 1 && r > 0 ? prog : f > 1 ? 100 : 0;
+      p2 = f === 2 && r > 0 ? prog : f > 2 ? 100 : 0;
+      p3 = f === 3 && r > 0 ? prog : f < 3 ? 0 : 100;
+      if (f === 0 && r === 0) p3 = 0;
+    }
 
     const el0 = document.getElementById("prog0");
     const el1 = document.getElementById("prog1");
@@ -377,41 +776,45 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     if (el2) el2.style.strokeDashoffset = String(100 - p2);
     if (el3) el3.style.strokeDashoffset = String(100 - p3);
 
-    const tolva = document.getElementById("tolva-obj");
-    const compuerta = document.getElementById("compuerta-obj");
-    let angComp = 0;
-    if (f === 0) {
-      if (d.tCS > 0) angComp = (d.ms / d.tCS) * -90;
-      if (angComp < -90) angComp = -90;
-    } else if (f === 1 || f === 2) {
-      angComp = -90;
-    } else if (f === 3) {
-      if (d.tCB > 0) {
-        let pr = d.ms / d.tCB;
-        if (pr > 1) pr = 1;
-        angComp = -90 + pr * 90;
+    if (!d.plcM) {
+      let angComp = 0;
+      if (f === 0) {
+        if (gt.tCS > 0) angComp = (d.ms / gt.tCS) * -90;
+        if (angComp < -90) angComp = -90;
+      } else if (f === 1 || f === 2) {
+        angComp = -90;
+      } else if (f === 3) {
+        if (gt.tCB > 0) {
+          let pr = d.ms / gt.tCB;
+          if (pr > 1) pr = 1;
+          angComp = -90 + pr * 90;
+        }
       }
-    }
 
-    if (d.relays & 2) {
-      if (anguloTolva.current < 45) anguloTolva.current += VEL_7S;
-    } else if (d.relays & 4) {
-      if (anguloTolva.current > 0) anguloTolva.current -= VEL_7S;
-    }
-    if (f === 0 || f === 3) {
-      if (anguloTolva.current > 0) anguloTolva.current -= VEL_7S * 2;
-      if (anguloTolva.current < 0) anguloTolva.current = 0;
-    }
+      if (d.relays & 2) {
+        if (anguloTolva.current < 45) anguloTolva.current += VEL_7S;
+      } else if (d.relays & 4) {
+        if (anguloTolva.current > 0) anguloTolva.current -= VEL_7S;
+      }
+      if (f === 0 || f === 3) {
+        if (anguloTolva.current > 0) anguloTolva.current -= VEL_7S * 2;
+        if (anguloTolva.current < 0) anguloTolva.current = 0;
+      }
 
-    if (tolva) tolva.style.transform = `rotate(${anguloTolva.current.toFixed(1)}deg)`;
-    if (compuerta) compuerta.style.transform = `rotate(${angComp.toFixed(1)}deg)`;
+      document.querySelectorAll(".omnitec-scada .truck-bed-wrapper").forEach((el) => {
+        (el as HTMLElement).style.transform = `rotate(${anguloTolva.current.toFixed(1)}deg)`;
+      });
+      document.querySelectorAll(".omnitec-scada .truck-gate-wrapper").forEach((el) => {
+        (el as HTMLElement).style.transform = `rotate(${angComp.toFixed(1)}deg)`;
+      });
+    }
 
     const hC = document.getElementById("h-ciclos");
     const hT = document.getElementById("h-tiempo");
     const hL = document.getElementById("h-limC");
     if (hC) hC.innerText = String(d.ciclos);
     if (hT) hT.innerText = `${Math.floor(d.uso / 3600)}h ${Math.floor((d.uso % 3600) / 60)}m`;
-    if (hL) hL.innerText = String(d.limC);
+    if (hL) hL.innerText = limC != null ? String(limC) : "—";
 
     if (d.alerta && !esperandoReset.current) {
       const ol = document.getElementById("alerta-overlay");
@@ -419,12 +822,12 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         ol.classList.add("open");
         const oc = document.getElementById("overlay-ciclos");
         const ou = document.getElementById("overlay-uso");
-        if (oc) oc.innerText = `${d.ciclos} / ${d.limC}`;
+        if (oc) oc.innerText = `${d.ciclos} / ${limC ?? "—"}`;
         if (ou) ou.innerText = `${Math.floor(d.uso / 3600)}h`;
       }
       setAlertaOpen(true);
     }
-  }, [tel, authenticated]);
+  }, [tel, authenticated, plcConfig]);
 
   function pLog(n: number) {
     if (pinLogin.length < 4) {
@@ -441,44 +844,54 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     if (el) el.innerText = "____";
   }
 
-  function enviarLogin() {
+  async function enviarLogin() {
     if (pinLogin.length !== 4) return;
 
     if (LOGIN_PIN_STATIC && pinLogin === LOGIN_PIN_STATIC) {
       setAuthenticated(true);
       setPinLogin("");
       setLoginError("");
+      if (configOrigin) {
+        const cfg = await fetchPlcConfig(configOrigin);
+        if (cfg) setPlcConfig(cfg);
+      }
       return;
     }
 
-    const c = clientRef.current;
-    if (!c?.connected) {
-      setLoginError("SIN CONEXIÓN MQTT");
-      setTimeout(() => setLoginError(""), 3500);
+    const mq = clientRef.current;
+    if (!mq?.connected) {
+      setLoginError("SIN CONEXIÓN AL BROKER MQTT (wss). Comprueba red y NEXT_PUBLIC_MQTT_WS_URL.");
+      setTimeout(() => setLoginError(""), 5000);
       return;
     }
 
     if (authTimerRef.current) clearTimeout(authTimerRef.current);
-    
-    // Si ya tenemos el PIN de la telemetría, validamos instantáneo
+
     if (rawPinFromESP !== "" && pinLogin === rawPinFromESP) {
-        setAuthenticated(true);
-        setPinLogin("");
-        setLoginError("");
-        return;
+      setAuthenticated(true);
+      setPinLogin("");
+      setLoginError("");
+      if (configOrigin) {
+        const cfg = await fetchPlcConfig(configOrigin);
+        if (cfg) setPlcConfig(cfg);
+      }
+      return;
     }
 
+    setLoginError("");
     pendingAuth.current = true;
-    publishCmd({ authLogin: pinLogin, checkPin: pinLogin });
+    publishCmd({ checkPin: pinLogin });
 
     authTimerRef.current = setTimeout(() => {
       if (pendingAuth.current) {
         pendingAuth.current = false;
-        setLoginError("PIN INCORRECTO O SIN RESPUESTA");
+        setLoginError(
+          "Sin ACK ni authOk en telemetría. Revisa omnitec/cmd y omnitec/ack para esta unidad.",
+        );
         borrarPLog();
-        setTimeout(() => setLoginError(""), 3000);
+        setTimeout(() => setLoginError(""), 6000);
       }
-    }, 4000);
+    }, 8000);
   }
 
   function abrirCine() {
@@ -534,17 +947,29 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     setPin("");
   }
 
+  function pMante(n: number) {
+    if (pinMante.length < 4) setPinMante((s) => s + String(n));
+  }
+
+  function borrarMante() {
+    setPinMante("");
+  }
+
   function validarAcceso() {
     if (pinCheckTimerRef.current) clearTimeout(pinCheckTimerRef.current);
-    
-    // Validación instantánea local si el ESP32 mandó el PIN en la telemetría
+
     if (rawPinFromESP !== "" && pin === rawPinFromESP) {
-        const bloqueo = document.getElementById("panel-bloqueo");
-        const edicion = document.getElementById("panel-edicion");
-        if (bloqueo) bloqueo.style.display = "none";
-        if (edicion) edicion.style.display = "block";
-        setPin("");
-        return;
+      const bloqueo = document.getElementById("panel-bloqueo");
+      const edicion = document.getElementById("panel-edicion");
+      if (bloqueo) bloqueo.style.display = "none";
+      if (edicion) edicion.style.display = "block";
+      setPin("");
+      return;
+    }
+
+    if (!clientRef.current?.connected) {
+      showLog("SIN CONEXIÓN AL BROKER MQTT", "var(--rojo)");
+      return;
     }
 
     pendingPinCheck.current = true;
@@ -556,7 +981,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         showLog("PIN ERROR", "var(--rojo)");
         setPin("");
       }
-    }, 3000);
+    }, 4000);
   }
 
   function bloquear() {
@@ -567,57 +992,351 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   }
 
   function saveT() {
-    const cs = (document.getElementById("in-cs") as HTMLInputElement)?.value;
-    const cb = (document.getElementById("in-cb") as HTMLInputElement)?.value;
-    const ts = (document.getElementById("in-ts") as HTMLInputElement)?.value;
-    const tb = (document.getElementById("in-tb") as HTMLInputElement)?.value;
-    const payload: Record<string, unknown> = {};
-    
-    if (cs) payload.tCS = Number(cs) * 1000;
-    if (cb) payload.tCB = Number(cb) * 1000;
-    if (ts) payload.tTS = Number(ts) * 1000;
-    if (tb) payload.tTB = Number(tb) * 1000;
-    
-    if (Object.keys(payload).length) {
-      publishCmd(payload);
-      showLog("TIEMPOS GUARDADOS", "var(--verde)");
+    const cs = readSecFromInputOrPh("in-cs", phCS);
+    const cb = readSecFromInputOrPh("in-cb", phCB);
+    const ts = readSecFromInputOrPh("in-ts", phTS);
+    const tb = readSecFromInputOrPh("in-tb", phTB);
+    if (![cs, cb, ts, tb].some((n) => Number.isFinite(n))) {
+      showLog("SIN TIEMPOS PARA GUARDAR", "var(--ambar)");
+      return;
     }
+    const sec = (n: number) => (Number.isFinite(n) ? n : 0);
+    const payload = mqttPayloadSetT(sec(cs) * 1000, sec(cb) * 1000, sec(ts) * 1000, sec(tb) * 1000);
+    if (!publishCmd(payload)) {
+      showLog("SIN CONEXIÓN MQTT", "var(--rojo)");
+      return;
+    }
+    showLog("TIEMPOS GUARDADOS", "var(--verde)");
+  }
+
+  function togglePlcMode() {
+    const current = tel?.plcM ?? false;
+    const next = !current;
+    if (
+      !window.confirm(
+        next
+          ? "¿Activar modo PLC libre? El volquete clásico quedará deshabilitado en el equipo."
+          : "¿Volver al modo volquete mina?",
+      )
+    ) {
+      return;
+    }
+    if (!publishCmd(mqttPayloadSetMode(next))) {
+      showLog("SIN CONEXIÓN MQTT", "var(--rojo)");
+      return;
+    }
+    showLog(next ? "MODO PLC SOLICITADO" : "MODO VOLQUETE SOLICITADO", "var(--ambar)");
+    window.setTimeout(() => {
+      const t = telRef.current;
+      if (t && t.plcM !== next) {
+        showLog(
+          "El equipo no confirmó el cambio. En OMNIPRO.ino el mqttCallback solo aplica checkPin: integre aplicarComandoMqtt (arduino/omnipro_mqtt_callback.cpp + PASOS_MQTT.txt).",
+          "var(--rojo)",
+        );
+      } else if (t && t.plcM === next) {
+        showLog("MODO CONFIRMADO POR TELEMETRÍA", "var(--verde)");
+      }
+    }, 4500);
   }
 
   function guardarTodo() {
-    const payload: Record<string, unknown> = {};
-    const np = (document.getElementById("new-pin") as HTMLInputElement)?.value;
-    if (np?.length === 4) payload.newPin = np;
-    
-    const c = (document.getElementById("lim-c") as HTMLInputElement)?.value;
-    const m = (document.getElementById("lim-m") as HTMLInputElement)?.value;
-    if (c) payload.limC = Number(c);
-    if (m) payload.limM = Number(m);
-    
-    const idu = (document.getElementById("id-uni") as HTMLInputElement)?.value;
-    const toku = (document.getElementById("tok-uni") as HTMLInputElement)?.value;
-    if (idu) payload.newId = idu;
-    if (toku) payload.newToken = toku;
-    
-    const tp = (document.getElementById("t-apagado") as HTMLInputElement)?.value;
-    if (tp) payload.tApagado = Number(tp);
-    
-    if (Object.keys(payload).length) publishCmd(payload);
+    const np = (document.getElementById("new-pin") as HTMLInputElement)?.value?.trim();
+    const npm = (document.getElementById("new-pin-mante") as HTMLInputElement)?.value?.trim();
+
+    const lc = readSecFromInputOrPh("lim-c", phLC);
+    const lm = readSecFromInputOrPh("lim-m", phLM);
+    const tp = readSecFromInputOrPh("t-apagado", phTP);
+
+    const idFallback = plcConfig?.id ?? mqttUnitId;
+    const tokFallback = plcConfig?.token ?? "";
+    const idEl = typeof document !== "undefined" ? (document.getElementById("id-uni") as HTMLInputElement | null) : null;
+    const tokEl = typeof document !== "undefined" ? (document.getElementById("tok-uni") as HTMLInputElement | null) : null;
+    const idTyped = idEl?.value?.trim() ?? "";
+    const tokTyped = tokEl?.value?.trim() ?? "";
+
+    const cmds: Record<string, unknown>[] = [];
+    if (np?.length === 4) cmds.push(mqttPayloadNewOperPin(np));
+    if (npm?.length === 4) cmds.push(mqttPayloadMantePin(npm));
+
+    if (Number.isFinite(lc) || Number.isFinite(lm)) {
+      const c = Number.isFinite(lc) ? Math.round(lc as number) : Math.round(Number(phLC) || 0);
+      const m = Number.isFinite(lm) ? Math.round(lm as number) : Math.round(Number(phLM) || 0);
+      cmds.push(mqttPayloadSetMante(c, m));
+    }
+
+    if (idTyped || tokTyped) {
+      cmds.push(mqttPayloadIdentidad(idTyped || idFallback, tokTyped || tokFallback));
+    }
+
+    if (Number.isFinite(tp)) cmds.push(mqttPayloadApagadoMin(Math.round(tp as number)));
+
+    if (cmds.length === 0) {
+      showLog("NADA QUE GUARDAR", "var(--ambar)");
+      bloquear();
+      return;
+    }
+    for (const payload of cmds) {
+      if (!publishCmd(payload)) {
+        showLog("SIN CONEXIÓN MQTT", "var(--rojo)");
+        return;
+      }
+    }
+    if (idTyped) setMqttUnitId(idTyped || idFallback);
+    if (configOrigin) {
+      void fetchPlcConfig(configOrigin).then((c) => {
+        if (c) setPlcConfig(c);
+      });
+    }
     bloquear();
     showLog("GUARDADO", "var(--verde)");
   }
 
-  function confirmarMantenimiento() {
-    esperandoReset.current = true;
+  function posponerMantenimiento() {
     const ol = document.getElementById("alerta-overlay");
     if (ol) ol.classList.remove("open");
     setAlertaOpen(false);
-    
-    publishCmd({ resetMante: "true" });
-    
+    if (!publishCmd(mqttPayloadSnoozeMante())) {
+      showLog("SIN CONEXIÓN MQTT", "var(--rojo)");
+      return;
+    }
+    showLog("MANTENIMIENTO POSPUESTO", "var(--ambar)");
+  }
+
+  function abrirPinMantenimiento() {
+    const ol = document.getElementById("alerta-overlay");
+    if (ol) ol.classList.remove("open");
+    setAlertaOpen(false);
+    setPinMante("");
+    setManteAuthOpen(true);
+  }
+
+  function enviarMantePIN() {
+    if (pinMante.length !== 4) return;
+    if (!publishCmd(mqttPayloadResetMante(pinMante))) {
+      showLog("SIN CONEXIÓN MQTT", "var(--rojo)");
+      return;
+    }
+    esperandoReset.current = true;
+    setManteAuthOpen(false);
+    setPinMante("");
     setTimeout(() => {
       esperandoReset.current = false;
     }, 1500);
+    showLog("REINICIO MANTENIMIENTO ENVIADO", "var(--verde)");
+  }
+
+  function cerrarMantePIN() {
+    setManteAuthOpen(false);
+    setPinMante("");
+  }
+
+  function abrirEspLocal(path?: string) {
+    const base = espLanOrigin ?? configOrigin;
+    if (!base) {
+      showLog("Configure NEXT_PUBLIC_OMNITEC_ESP_ORIGIN (URL del AP del equipo).", "var(--ambar)");
+      return;
+    }
+    const url = path ? `${base.replace(/\/$/, "")}/${path.replace(/^\//, "")}` : base;
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+
+  async function loadCajaNegraLogs() {
+    const uid = mqttUnitId.trim();
+    if (uid) {
+      setCajaLoading(true);
+      try {
+        const res = await fetch(`/api/unit-logs/${encodeURIComponent(uid)}`, {
+          cache: "no-store",
+        });
+        if (res.ok) {
+          const txt = await res.text();
+          if (txt.trim()) {
+            setCajaGrouped(groupLogsByDay(txt));
+            setCajaLoading(false);
+            return;
+          }
+        }
+      } catch {
+        /* usar MQTT o AP */
+      }
+    }
+    const fromMqtt = telRef.current?.cn;
+    if (fromMqtt && fromMqtt.length > 0) {
+      setCajaGrouped(groupLogsByDay(fromMqtt.join("\n")));
+      setCajaLoading(false);
+      return;
+    }
+    const base = espLanOrigin ?? configOrigin;
+    if (!base) {
+      showLog("Sin datos MQTT (cn) ni origen AP: actualice el firmware o configure NEXT_PUBLIC_OMNITEC_ESP_ORIGIN.", "var(--ambar)");
+      setCajaGrouped(null);
+      setCajaLoading(false);
+      return;
+    }
+    setCajaLoading(true);
+    try {
+      const res = await fetch(`${base.replace(/\/$/, "")}/api/logs`, { cache: "no-store", credentials: "omit" });
+      const txt = await res.text();
+      if (!txt.trim() || txt.includes("Sin registros")) {
+        setCajaGrouped({});
+        showLog("SIN REGISTROS EN EL EQUIPO", "var(--ambar)");
+      } else {
+        setCajaGrouped(groupLogsByDay(txt));
+      }
+    } catch {
+      setCajaGrouped(null);
+      showLog("NO SE PUDO LEER /api/logs (CORS o sesión AP). Con firmware actual, los datos llegan por MQTT (cn).", "var(--rojo)");
+    } finally {
+      setCajaLoading(false);
+    }
+  }
+
+  function toggleCajaNegraPanel() {
+    setCajaOpen((open) => {
+      if (!open) void loadCajaNegraLogs();
+      return !open;
+    });
+  }
+
+  function drawChartCanvas(points: ReturnType<typeof buildChartPointsFromCsv>) {
+    const canvas = chartCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const parent = canvas.parentElement;
+    const rect = parent?.getBoundingClientRect();
+    const w = rect?.width ?? 400;
+    const h = 280;
+    canvas.width = w * 2;
+    canvas.height = h * 2;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.scale(2, 2);
+    drawActividadDiariaChart(ctx, w, h, points);
+  }
+
+  function isCajaDayExpanded(day: string, index: number) {
+    if (cajaDayOpen[day] !== undefined) return cajaDayOpen[day];
+    return index === 0;
+  }
+
+  function toggleCajaDay(day: string, index: number) {
+    setCajaDayOpen((p) => {
+      const cur = p[day] !== undefined ? p[day] : index === 0;
+      return { ...p, [day]: !cur };
+    });
+  }
+
+  async function abrirGraficoActividad() {
+    setChartOpen(true);
+    const uid = mqttUnitId.trim();
+    if (uid) {
+      try {
+        const res = await fetch(`/api/unit-logs/${encodeURIComponent(uid)}`, {
+          cache: "no-store",
+        });
+        if (res.ok) {
+          const txt = await res.text();
+          if (txt.trim()) {
+            const pts = buildChartPointsFromCsv(txt);
+            setTimeout(() => drawChartCanvas(pts), 100);
+            return;
+          }
+        }
+      } catch {
+        /* MQTT o AP */
+      }
+    }
+    const lines = telRef.current?.cn;
+    if (lines && lines.length > 0) {
+      const pts = buildChartPointsFromCsv(lines.join("\n"));
+      setTimeout(() => drawChartCanvas(pts), 100);
+      return;
+    }
+    const base = espLanOrigin ?? configOrigin;
+    if (!base) {
+      setTimeout(() => drawChartCanvas([]), 100);
+      return;
+    }
+    try {
+      const res = await fetch(`${base.replace(/\/$/, "")}/api/logs`, { cache: "no-store", credentials: "omit" });
+      const txt = await res.text();
+      const pts = buildChartPointsFromCsv(txt);
+      setTimeout(() => drawChartCanvas(pts), 100);
+    } catch {
+      setTimeout(() => drawChartCanvas([]), 100);
+    }
+  }
+
+  async function procesarDescargaCsv() {
+    const base = espLanOrigin ?? configOrigin;
+    if (!base) {
+      showLog("Configure NEXT_PUBLIC_OMNITEC_ESP_ORIGIN.", "var(--ambar)");
+      return;
+    }
+    if (dlTipo === "rango" && (!dlDesde || !dlHasta)) {
+      showLog("SELECCIONE FECHAS", "var(--ambar)");
+      return;
+    }
+    if (dlTipo === "rango" && dlDesde > dlHasta) {
+      showLog("RANGO INVÁLIDO", "var(--rojo)");
+      return;
+    }
+    setDownloadOpen(false);
+    showLog("DESCARGANDO…", "var(--cyan)");
+    try {
+      const res = await fetch(`${base.replace(/\/$/, "")}/api/download_log`, { cache: "no-store", credentials: "omit" });
+      const blob = await res.blob();
+      const text = await blob.text();
+      if (!text.trim()) {
+        showLog("SIN DATOS", "var(--rojo)");
+        return;
+      }
+      if (dlTipo === "todo") {
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(new Blob(["\uFEFF" + text], { type: "text/csv;charset=utf-8" }));
+        a.download = "Historial_OMNITEC.csv";
+        a.click();
+        URL.revokeObjectURL(a.href);
+        showLog("DESCARGA LISTA", "var(--verde)");
+        return;
+      }
+      const start = new Date(`${dlDesde}T00:00:00`).getTime();
+      const end = new Date(`${dlHasta}T23:59:59`).getTime();
+      const lines = text.split("\n");
+      const logsByDay: Record<string, string[]> = {};
+      const dates: string[] = [];
+      for (const line of lines) {
+        const parsed = parseLogLine(line);
+        if (!parsed || parsed.day === "OTROS" || parsed.day === "BOOT-INIT") continue;
+        const dp = parsed.day.split("/");
+        if (dp.length === 3) {
+          const logDate = new Date(`20${dp[2]}-${dp[1]}-${dp[0]}T12:00:00`).getTime();
+          if (logDate < start || logDate > end) continue;
+        }
+        if (!logsByDay[parsed.day]) {
+          logsByDay[parsed.day] = [];
+          dates.push(parsed.day);
+        }
+        logsByDay[parsed.day].push(`${parsed.time} - ${parsed.ev}`);
+      }
+      if (dates.length === 0) {
+        showLog("RANGO SIN DATOS", "var(--rojo)");
+        return;
+      }
+      let csvOutput = `${dates.map((d) => `"${d}"`).join(";")}\n`;
+      const maxRows = Math.max(...dates.map((d) => logsByDay[d].length));
+      for (let i = 0; i < maxRows; i++) {
+        csvOutput += `${dates.map((d) => `"${(logsByDay[d][i] || "").replace(/"/g, '""')}"`).join(";")}\n`;
+      }
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob(["\uFEFF" + csvOutput], { type: "text/csv;charset=utf-8" }));
+      a.download = "Reporte_Dinamico_OMNITEC.csv";
+      a.click();
+      URL.revokeObjectURL(a.href);
+      showLog("DESCARGA EXITOSA", "var(--verde)");
+    } catch {
+      showLog("ERROR DE RED / CORS — use el AP local.", "var(--rojo)");
+    }
   }
 
   function abrirWiFi() {
@@ -637,20 +1356,82 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   }
 
   function conectarWiFi() {
-    // Para simplificar, esta función se mantiene visual pero la lógica completa de WiFi se hace idealmente desde el AP
+    // La configuración WiFi real se hace desde el AP del equipo; aquí solo cerramos el panel.
     cerrarWiFi();
+    showLog("CONFIGURA WIFI DESDE EL AP LOCAL DEL EQUIPO", "var(--ambar)");
   }
 
-  const phCS = tel && tel.tCS > 0 ? String(tel.tCS / 1000) : "";
-  const phCB = tel && tel.tCB > 0 ? String(tel.tCB / 1000) : "";
-  const phTS = tel && tel.tTS > 0 ? String(tel.tTS / 1000) : "";
-  const phTB = tel && tel.tTB > 0 ? String(tel.tTB / 1000) : "";
-  const phLC = tel && tel.limC > 0 ? String(tel.limC) : "";
-  const phLM = tel && tel.limM > 0 ? String(Math.floor(tel.limM / 3600) || Math.floor(tel.limM / 60)) : "";
-  const phTP = ""; // El ESP32 no manda tApagado por defecto, puedes añadirlo en main.cpp si lo necesitas
+  function olvidarWiFi() {
+    if (typeof window !== "undefined" && window.confirm("¿Seguro que deseas olvidar la red WiFi?")) {
+      showLog("OLVIDAR WIFI: USE EL AP LOCAL DEL EQUIPO", "var(--ambar)");
+      cerrarWiFi();
+    }
+  }
+
+  /** Placeholders: prioridad telemetría MQTT (tCS… ms o cs… s), luego GET /api/config (también si el valor es 0). */
+  const { phCS, phCB, phTS, phTB, phLC, phLM, phTP } = useMemo(() => {
+    function pickSec(
+      ms: number | undefined,
+      sec: number | undefined,
+      plcN: number | undefined,
+    ): string {
+      if (ms != null && Number.isFinite(ms)) return String(ms / 1000);
+      if (sec != null && Number.isFinite(sec)) return String(sec);
+      if (plcN !== undefined && plcN !== null && Number.isFinite(plcN)) return String(plcN);
+      return "";
+    }
+    const p = plcConfig;
+    return {
+      phCS: pickSec(tel?.tCS, tel?.cs, p?.cs),
+      phCB: pickSec(tel?.tCB, tel?.cb, p?.cb),
+      phTS: pickSec(tel?.tTS, tel?.ts, p?.ts),
+      phTB: pickSec(tel?.tTB, tel?.tb, p?.tb),
+      phLC: (() => {
+        if (tel?.limC != null && Number.isFinite(tel.limC)) return String(tel.limC);
+        if (p && p.lc !== undefined && Number.isFinite(p.lc)) return String(p.lc);
+        return "";
+      })(),
+      phLM: (() => {
+        if (tel?.limM != null && Number.isFinite(tel.limM)) return String(tel.limM);
+        if (p && p.lm !== undefined && Number.isFinite(p.lm)) return String(p.lm);
+        return "";
+      })(),
+      phTP: p?.tp?.trim() ? p.tp : "",
+    };
+  }, [tel, plcConfig]);
+
+  /** Volcado suave a inputs vacíos (misma idea que cargarConfiguración / placeholders vivos en el ESP). */
+  useEffect(() => {
+    const put = (id: string, val: string) => {
+      if (!val || val === "—") return;
+      const el = document.getElementById(id) as HTMLInputElement | null;
+      if (!el || document.activeElement === el) return;
+      if (!el.value?.trim()) el.value = val;
+    };
+    put("in-cs", phCS);
+    put("in-cb", phCB);
+    put("in-ts", phTS);
+    put("in-tb", phTB);
+  }, [phCS, phCB, phTS, phTB]);
+
+  useEffect(() => {
+    const put = (id: string, val: string) => {
+      if (val === undefined || val === null) return;
+      const el = document.getElementById(id) as HTMLInputElement | null;
+      if (!el || document.activeElement === el) return;
+      if (!el.value?.trim()) el.value = val;
+    };
+    put("lim-c", phLC);
+    put("lim-m", phLM);
+    put("t-apagado", phTP);
+    put("id-uni", plcConfig?.id ?? mqttUnitId);
+    if (plcConfig?.token) put("tok-uni", plcConfig.token);
+  }, [phLC, phLM, phTP, plcConfig?.id, plcConfig?.token, mqttUnitId]);
 
   return (
     <div className="omnitec-scada">
+      <div id="toast-overlay" />
+
       <div id="auth-overlay" className={authenticated ? "hidden" : undefined}>
         <div
           style={{
@@ -673,15 +1454,12 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
           >
             ACCESO OMNITEC
           </h2>
-          <p style={{ color: "#888", fontSize: "0.8rem", marginBottom: 20 }}>
-            INGRESE PIN DE ACCESO
-          </p>
           <div
             id="login-pin-display"
             style={{
               fontSize: "2.5rem",
               letterSpacing: 15,
-              marginBottom: 20,
+              margin: "20px 0",
               color: "var(--ambar)",
             }}
           >
@@ -720,10 +1498,9 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
             id="login-error"
             style={{
               color: "var(--rojo)",
-              fontSize: "0.75rem",
+              fontSize: "0.8rem",
               marginTop: 10,
-              minHeight: "2.5em",
-              lineHeight: 1.35,
+              minHeight: 15,
             }}
           >
             {loginError}
@@ -769,9 +1546,220 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               </span>
             </div>
           </div>
-          <button type="button" className="boton btn-mante" onClick={confirmarMantenimiento}>
-            CONFIRMAR SERVICIO
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 10,
+              justifyContent: "center",
+            }}
+          >
+            <button type="button" className="boton btn-gris" onClick={posponerMantenimiento}>
+              LUEGO
+            </button>
+            <button type="button" className="boton btn-mante" onClick={abrirPinMantenimiento}>
+              CONFIRMAR
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div id="mante-auth-overlay" className={manteAuthOpen ? "open" : undefined}>
+        <div
+          style={{
+            textAlign: "center",
+            padding: 30,
+            border: "2px solid var(--ambar)",
+            borderRadius: 20,
+            background: "#1a1a1a",
+            maxWidth: "90%",
+            width: 360,
+          }}
+        >
+          <h2 style={{ border: "none", margin: "0 0 16px", fontSize: "1.1rem" }}>PIN MANTENIMIENTO</h2>
+          <div
+            style={{
+              fontSize: "2rem",
+              letterSpacing: 12,
+              marginBottom: 12,
+              color: "var(--ambar)",
+            }}
+          >
+            {pinMante.padEnd(4, "_")}
+          </div>
+          <div className="teclado">
+            <button type="button" className="tecla" onClick={() => pMante(1)}>
+              1
+            </button>
+            <button type="button" className="tecla" onClick={() => pMante(2)}>
+              2
+            </button>
+            <button type="button" className="tecla" onClick={() => pMante(3)}>
+              3
+            </button>
+            <button type="button" className="tecla" onClick={() => pMante(4)}>
+              4
+            </button>
+          </div>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 1fr",
+              gap: 10,
+              marginTop: 12,
+            }}
+          >
+            <button type="button" className="boton btn-gris" onClick={borrarMante}>
+              BORRAR
+            </button>
+            <button type="button" className="boton btn-azul" onClick={enviarMantePIN}>
+              ENVIAR
+            </button>
+          </div>
+          <button
+            type="button"
+            className="boton btn-gris"
+            style={{ marginTop: 12, width: "100%" }}
+            onClick={cerrarMantePIN}
+          >
+            CANCELAR
           </button>
+        </div>
+      </div>
+
+      <div id="ota-overlay" className={otaOpen ? "open" : undefined}>
+        <div
+          style={{
+            textAlign: "center",
+            padding: 30,
+            border: "2px solid var(--azul)",
+            borderRadius: 20,
+            background: "#1a1a1a",
+            width: "80%",
+            maxWidth: 400,
+          }}
+        >
+          <h2 style={{ border: "none", marginTop: 0 }}>ACTUALIZAR SISTEMA</h2>
+          <p style={{ color: "#888", fontSize: "0.8rem" }}>
+            Subida directa al ESP (mismo esquema que el AP). Si esta página es HTTPS y el equipo es HTTP, el
+            navegador puede bloquear el envío: use el AP en{" "}
+            <button type="button" className="boton btn-azul" style={{ padding: "4px 8px" }} onClick={() => abrirEspLocal()}>
+              nueva pestaña
+            </button>{" "}
+            o la red local.
+          </p>
+          {espLanOrigin || configOrigin ? (
+            <form
+              method="POST"
+              encType="multipart/form-data"
+              action={`${(espLanOrigin ?? configOrigin)!.replace(/\/$/, "")}/update`}
+              target="_blank"
+              style={{ display: "flex", flexDirection: "column", gap: 12 }}
+            >
+              <input type="file" name="update" accept=".bin" required style={{ background: "#222", color: "white" }} />
+              <button type="submit" className="boton btn-azul">
+                INICIAR ACTUALIZACIÓN
+              </button>
+            </form>
+          ) : (
+            <p style={{ color: "var(--rojo)", fontSize: "0.85rem" }}>Configure NEXT_PUBLIC_OMNITEC_ESP_ORIGIN.</p>
+          )}
+          <button type="button" className="boton btn-gris" style={{ marginTop: 12 }} onClick={() => setOtaOpen(false)}>
+            CANCELAR
+          </button>
+        </div>
+      </div>
+
+      <div id="chart-overlay" className={chartOpen ? "open" : undefined}>
+        <div
+          style={{
+            width: "100%",
+            maxWidth: 800,
+            background: "#111",
+            border: "1px solid var(--cyan)",
+            borderRadius: 15,
+            padding: 20,
+            position: "relative",
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => setChartOpen(false)}
+            style={{
+              position: "absolute",
+              top: 10,
+              right: 15,
+              background: "none",
+              border: "none",
+              color: "white",
+              fontSize: "1.5rem",
+              cursor: "pointer",
+            }}
+          >
+            ✖
+          </button>
+          <h2
+            style={{
+              color: "var(--cyan)",
+              textAlign: "center",
+              border: "none",
+              marginBottom: 16,
+              letterSpacing: 2,
+            }}
+          >
+            ACTIVIDAD DIARIA DE OPERACIÓN
+          </h2>
+          <div style={{ width: "100%", height: 300, position: "relative" }}>
+            <canvas ref={chartCanvasRef} style={{ width: "100%", height: "100%" }} />
+          </div>
+        </div>
+      </div>
+
+      <div id="download-overlay" className={downloadOpen ? "open" : undefined}>
+        <div
+          style={{
+            textAlign: "center",
+            padding: 30,
+            border: "2px solid var(--azul)",
+            borderRadius: 20,
+            background: "#1a1a1a",
+            width: "80%",
+            maxWidth: 400,
+          }}
+        >
+          <h2 style={{ color: "var(--ambar)", border: "none", fontSize: "1.1rem" }}>DESCARGAR HISTORIAL</h2>
+          <div className="input-group" style={{ textAlign: "left", marginBottom: 15 }}>
+            <label style={{ color: "#888", fontSize: "0.7rem" }}>RANGO DE FECHAS</label>
+            <select
+              id="dl-tipo"
+              value={dlTipo}
+              onChange={(e) => setDlTipo(e.target.value as "todo" | "rango")}
+              style={{ fontSize: "1rem", padding: 10, width: "100%" }}
+            >
+              <option value="todo">Todo el historial</option>
+              <option value="rango">Seleccionar días…</option>
+            </select>
+            {dlTipo === "rango" ? (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 10 }}>
+                <div>
+                  <label style={{ color: "var(--azul)", fontSize: "0.65rem" }}>DESDE</label>
+                  <input type="date" value={dlDesde} onChange={(e) => setDlDesde(e.target.value)} style={{ width: "100%" }} />
+                </div>
+                <div>
+                  <label style={{ color: "var(--azul)", fontSize: "0.65rem" }}>HASTA</label>
+                  <input type="date" value={dlHasta} onChange={(e) => setDlHasta(e.target.value)} style={{ width: "100%" }} />
+                </div>
+              </div>
+            ) : null}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+            <button type="button" className="boton btn-gris" onClick={() => setDownloadOpen(false)}>
+              CANCELAR
+            </button>
+            <button type="button" className="boton btn-azul" onClick={() => void procesarDescargaCsv()}>
+              DESCARGAR
+            </button>
+          </div>
         </div>
       </div>
 
@@ -791,9 +1779,12 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
           <select id="wifi-list">
             <option>Escaneando redes...</option>
           </select>
-          <input type="password" id="wifi-pass" placeholder="Contraseña Red WiFi" disabled/>
-          <button type="button" className="boton btn-azul" onClick={conectarWiFi} disabled>
+          <input type="password" id="wifi-pass" placeholder="Contraseña Red WiFi" />
+          <button type="button" className="boton btn-azul" onClick={conectarWiFi}>
             CONECTAR
+          </button>
+          <button type="button" className="boton btn-rojo" onClick={olvidarWiFi}>
+            OLVIDAR WIFI
           </button>
           <button type="button" className="boton btn-gris" onClick={cerrarWiFi}>
             CANCELAR
@@ -830,14 +1821,29 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         🔊
       </button>
 
-      <div className="contenedor">
-        <button type="button" className="btn-animacion-pro" onClick={abrirCine}>
-          VER ANIMACIÓN
-        </button>
+      <div className="contenedor" id="main-container">
+        <div className="top-btn-container">
+          {authenticated && (
+            <button
+              type="button"
+              id="btn-toggle-mode"
+              className="btn-animacion-pro"
+              onClick={togglePlcMode}
+            >
+              {tel?.plcM ? "RESTAURAR MODO VOLQUETE MINA" : "HABILITAR MODO PLC LIBRE"}
+            </button>
+          )}
+        </div>
 
-        <div className="tarjeta">
+        <div id="view-classic" style={{ display: tel?.plcM ? "none" : "block" }}>
+        <button type="button" className="btn-animacion-pro" onClick={abrirCine}>
+          VER ANIMACIÓN CAMION
+        </button>
+        <div className="tarjeta" id="tarjeta-pac">
           <div className="status-header">
-            <div className="badge-online">{unitId}</div>
+            <div id="badge-status-cls" className={mqttConnected ? "badge-online" : "badge-offline"}>
+              {mqttConnected ? "EN LÍNEA" : "SIN MQTT"} — {tel?.plcM ? "PLC LIBRE" : "VOLQUETE MINA"}
+            </div>
             <div
               className="badge-wifi"
               id="wifi-status-btn"
@@ -846,20 +1852,67 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               role="button"
               tabIndex={0}
             >
-              WIFI: AP LOCAL
+              📡 WIFI: AP LOCAL
             </div>
           </div>
-          <div id="cronometro" className="reloj-big">
+          <p
+            style={{
+              fontSize: "0.65rem",
+              color: "#888",
+              textAlign: "center",
+              margin: "0 0 10px 0",
+            }}
+          >
+            ID:{" "}
+            <span style={{ color: "var(--ambar)", fontWeight: 800 }}>{mqttUnitId}</span>
+            {unitId !== mqttUnitId ? (
+              <span style={{ display: "block", marginTop: 4, fontSize: "0.6rem" }}>
+                (ruta inicial: {unitId})
+              </span>
+            ) : null}
+          </p>
+          <div id="cronometro-cls" className="reloj-big">
             0.0s
           </div>
           <div id="fase-txt" className="estado-centro">
-            SISTEMA LISTO
+            SISTEMA LISTO v2.0
           </div>
 
           <div
             className="ciclo-wrapper"
             style={{ position: "relative", height: 280, width: 280, margin: "20px auto" }}
           >
+            <div
+              style={{
+                position: "absolute",
+                top: "50%",
+                left: "50%",
+                width: 1000,
+                height: 600,
+                transform: "translate(-50%, -50%) scale(0.13)",
+                pointerEvents: "none",
+                zIndex: 2,
+              }}
+            >
+              <div
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  height: "100%",
+                  transform: "translate(var(--global-x), var(--global-y))",
+                }}
+              >
+                <div className="truck-chassis truck-part" />
+                <div className="truck-bed-wrapper">
+                  <div className="truck-bed-img truck-part" />
+                  <div className="truck-gate-wrapper">
+                    <div className="truck-gate-img truck-part" />
+                  </div>
+                </div>
+              </div>
+            </div>
             <div id="n0" className="nodo n0">
               <span>
                 SUBIDA
@@ -937,6 +1990,104 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
             </svg>
           </div>
         </div>
+        </div>
+
+        <div id="view-plc" style={{ display: tel?.plcM ? "block" : "none" }}>
+          <div style={{ textAlign: "center" }}>
+            <button type="button" className="btn-animacion-pro" onClick={() => setPlcEditorOpen((v) => !v)}>
+              {plcEditorOpen ? "OCULTAR PROGRAMADOR I/O" : "PROGRAMADOR I/O"}
+            </button>
+          </div>
+          {plcEditorOpen ? (
+            <div className="tarjeta" id="editor-wrapper" style={{ marginTop: 18 }}>
+              <p style={{ fontSize: "0.75rem", color: "#888", textAlign: "center" }}>
+                El diseño lógico completo (recetas, simulador, arrastrar pasos) vive en la interfaz del AP. Con
+                la misma red que el equipo puede abrirla aquí embebida (solo HTTP→HTTP).
+              </p>
+              {espLanOrigin && typeof window !== "undefined" && window.location.protocol === "http:" ? (
+                <iframe
+                  title="Programador PLC"
+                  src={`${espLanOrigin.replace(/\/$/, "")}/`}
+                  style={{ width: "100%", height: 480, border: "1px solid #333", borderRadius: 12, background: "#000" }}
+                  sandbox="allow-scripts allow-same-origin allow-forms"
+                />
+              ) : (
+                <div style={{ textAlign: "center", padding: 20 }}>
+                  <button type="button" className="boton btn-azul" onClick={() => abrirEspLocal()}>
+                    ABRIR PROGRAMADOR EN EL EQUIPO (AP)
+                  </button>
+                </div>
+              )}
+            </div>
+          ) : null}
+
+          <div
+            className="tarjeta"
+            id="tarjeta-plc-monitor"
+            style={{ display: plcEditorOpen ? "none" : "block" }}
+          >
+            <div className="status-header">
+              <div id="badge-status-plc" className={mqttConnected ? "badge-online" : "badge-offline"}>
+                {mqttConnected ? "EN LÍNEA" : "SIN MQTT"} — PLC
+              </div>
+              <div
+                className="badge-wifi wifi-status-btn-plc"
+                id="wifi-status-btn-plc"
+                onClick={abrirWiFi}
+                onKeyDown={(e) => e.key === "Enter" && abrirWiFi()}
+                role="button"
+                tabIndex={0}
+              >
+                📡 WIFI: AP LOCAL
+              </div>
+            </div>
+            <p
+              style={{
+                fontSize: "0.65rem",
+                color: "#888",
+                textAlign: "center",
+                margin: "0 0 10px 0",
+              }}
+            >
+              ID:{" "}
+              <span style={{ color: "var(--ambar)", fontWeight: 800 }}>{mqttUnitId}</span>
+            </p>
+            <div id="cronometro-plc" className="reloj-big">
+              0.0s
+            </div>
+            <div id="plc-fase-txt" className="estado-centro">
+              PLC · R0 · COL 0 · PASO 1
+            </div>
+            <div
+              className="ciclo-wrapper plc-nodos-grid"
+              style={{
+                position: "relative",
+                minHeight: 200,
+                width: "100%",
+                maxWidth: 280,
+                margin: "16px auto",
+                display: "grid",
+                gridTemplateColumns: "1fr 1fr",
+                gap: 12,
+                alignItems: "center",
+                justifyItems: "center",
+              }}
+            >
+              <div id="rn0" className="plc-monitor-node">
+                <span>S1</span>
+              </div>
+              <div id="rn1" className="plc-monitor-node">
+                <span>S2</span>
+              </div>
+              <div id="rn2" className="plc-monitor-node">
+                <span>S3</span>
+              </div>
+              <div id="rn3" className="plc-monitor-node">
+                <span>S4</span>
+              </div>
+            </div>
+          </div>
+        </div>
 
         <div className="acordeon">
           <button type="button" className="acordeon-btn" onClick={toggleHistorial}>
@@ -960,27 +2111,157 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
           </div>
         </div>
 
+        <div className="acordeon" id="seccion-rtc" style={{ display: tel?.plcM ? "block" : "none" }}>
+          <button type="button" className="acordeon-btn" onClick={() => setRtcOpen((o) => !o)}>
+            PROGRAMADOR HORARIO (ALARMAS) <span>{rtcOpen ? "▲" : "▼"}</span>
+          </button>
+          <div
+            className="acordeon-content"
+            id="alarms-panel"
+            style={{ maxHeight: rtcOpen ? 420 : 0, overflow: "hidden", transition: "max-height 0.3s ease" }}
+          >
+            <p style={{ fontSize: "0.75rem", color: "#888", padding: "10px 0" }}>
+              Las alarmas viven en la receta PLC del equipo (misma lógica que el AP). Desde la nube, ábralas en la
+              interfaz local o use iframe si su página es HTTP y el ESP es HTTP en LAN.
+            </p>
+            <button type="button" className="boton btn-azul" style={{ width: "100%", marginBottom: 10 }} onClick={() => abrirEspLocal()}>
+              EDITAR ALARMAS EN EL AP
+            </button>
+          </div>
+        </div>
+
+        <div className="acordeon" id="seccion-cajanegra">
+          <div
+            className="acordeon-btn"
+            style={{
+              cursor: "default",
+              padding: "15px 10px",
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 8,
+              alignItems: "center",
+              justifyContent: "space-between",
+            }}
+          >
+            <div
+              style={{
+                flex: 1,
+                textAlign: "left",
+                cursor: "pointer",
+                display: "flex",
+                alignItems: "center",
+                fontSize: "0.9rem",
+              }}
+              onClick={() => toggleCajaNegraPanel()}
+              onKeyDown={(e) => e.key === "Enter" && toggleCajaNegraPanel()}
+              role="button"
+              tabIndex={0}
+            >
+              <span>CAJA NEGRA</span>
+              <span style={{ marginLeft: 5 }}>{cajaOpen ? "▲" : "▼"}</span>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button
+                type="button"
+                className="cn-calendar-btn"
+                title="Actividad diaria"
+                style={{ background: "var(--cyan)", borderColor: "var(--cyan)" }}
+                onClick={() => void abrirGraficoActividad()}
+              >
+                <span style={{ fontSize: "1.1rem", color: "#000" }}>📈</span>
+              </button>
+              <button type="button" className="cn-calendar-btn" title="Descargar historial" onClick={() => setDownloadOpen(true)}>
+                <span style={{ fontSize: "1.1rem" }}>⬇</span>
+              </button>
+            </div>
+          </div>
+          <p style={{ fontSize: "0.6rem", color: "#666", margin: "0 15px 8px", padding: "0 4px" }}>
+            Vista alineada al AP: por fecha, desplegable. Telemetría MQTT: hasta 40 líneas recientes; el historial
+            completo sigue en la SD / descarga por AP.
+          </p>
+          <div className="acordeon-content" style={{ maxHeight: cajaOpen ? 380 : 0, overflow: "hidden", transition: "max-height 0.3s ease" }}>
+            {cajaLoading ? (
+              <p style={{ padding: 10, fontSize: "0.75rem" }}>Cargando…</p>
+            ) : cajaBlocks.length > 0 ? (
+              <div id="cn-content" className="cn-content">
+                {cajaBlocks.map((block, di) => {
+                  const open = isCajaDayExpanded(block.day, di);
+                  const circle = block.day !== "OTROS" && block.day !== "BOOT-INIT" ? "🟢 " : "";
+                  return (
+                    <div key={block.day} style={{ marginBottom: 6 }}>
+                      <button
+                        type="button"
+                        className="cn-day-btn"
+                        onClick={() => toggleCajaDay(block.day, di)}
+                      >
+                        <span>
+                          {circle}
+                          {block.day}
+                        </span>
+                        <span>{open ? "▲" : "▼"}</span>
+                      </button>
+                      <div
+                        className="cn-day-content"
+                        style={{ display: open ? "block" : "none" }}
+                      >
+                        {block.items.map((row, i) => (
+                          <div key={`${block.day}-${i}-${row.time}`} className="log-entry">
+                            {row.time ? (
+                              <span className="log-entry-time">{row.time}</span>
+                            ) : null}
+                            <span className="log-entry-ev" style={{ color: getColorForEvent(row.event) }}>
+                              {row.event}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <p style={{ padding: 10, fontSize: "0.75rem", color: "#888" }}>
+                Sin líneas en telemetría (<code style={{ color: "var(--ambar)" }}>cn</code>) ni CSV por HTTP. Actualice el
+                firmware del ESP (caja negra en MQTT) o configure{" "}
+                <code style={{ color: "var(--ambar)" }}>NEXT_PUBLIC_OMNITEC_ESP_ORIGIN</code> y abra el{" "}
+                <button type="button" className="boton btn-gris" style={{ padding: "2px 8px" }} onClick={() => abrirEspLocal()}>
+                  AP local
+                </button>
+                .
+              </p>
+            )}
+          </div>
+        </div>
+
         <div className="tarjeta">
-          <h2>CONFIGURAR TIEMPOS (SEG)</h2>
+          <h2 id="lbl-tiempos">CONFIGURAR TIEMPOS (S)</h2>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
             <div className="input-group">
-              <label htmlFor="in-cs">COMPUERTA SUB</label>
+              <label htmlFor="in-cs" id="l-cs">
+                COMPUERTA SUBIDA
+              </label>
               <input type="number" id="in-cs" placeholder={phCS || "—"} />
             </div>
             <div className="input-group">
-              <label htmlFor="in-cb">COMPUERTA BAJ</label>
+              <label htmlFor="in-cb" id="l-cb">
+                COMPUERTA BAJADA
+              </label>
               <input type="number" id="in-cb" placeholder={phCB || "—"} />
             </div>
             <div className="input-group">
-              <label htmlFor="in-ts">TOLVA SUB</label>
+              <label htmlFor="in-ts" id="l-ts">
+                TOLVA SUBIDA
+              </label>
               <input type="number" id="in-ts" placeholder={phTS || "—"} />
             </div>
             <div className="input-group">
-              <label htmlFor="in-tb">TOLVA BAJ</label>
+              <label htmlFor="in-tb" id="l-tb">
+                TOLVA BAJADA
+              </label>
               <input type="number" id="in-tb" placeholder={phTB || "—"} />
             </div>
           </div>
-          <button type="button" className="boton btn-azul" onClick={saveT}>
+          <button type="button" className="boton btn-azul" id="btn-save-t" onClick={saveT}>
             GUARDAR CAMBIOS
           </button>
         </div>
@@ -1031,9 +2312,25 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
             </div>
           </div>
           <div id="panel-edicion" style={{ display: "none" }}>
+            <button
+              type="button"
+              className="boton btn-mante"
+              style={{ marginBottom: 20, width: "100%" }}
+              onClick={() => setOtaOpen(true)}
+            >
+              ACTUALIZAR SISTEMA (OTA)
+            </button>
+            <p style={{ fontSize: "0.65rem", color: "#888", marginBottom: 12 }}>
+              OTA y programador completo requieren alcanzar al ESP por LAN o abrir el AP (
+              {espLanOrigin ?? configOrigin ?? "configure ESP_ORIGIN"}).
+            </p>
             <div className="input-group" style={{ marginBottom: 15 }}>
               <label htmlFor="new-pin">CAMBIAR PIN</label>
               <input type="number" id="new-pin" placeholder="NUEVO PIN" />
+            </div>
+            <div className="input-group" style={{ marginBottom: 15 }}>
+              <label htmlFor="new-pin-mante">PIN MANTENIMIENTO (4 DÍGITOS)</label>
+              <input type="number" id="new-pin-mante" placeholder="PIN MANT." maxLength={4} />
             </div>
             <div style={{ borderTop: "1px solid #333", margin: "10px 0", paddingTop: 15 }}>
               <h2 style={{ border: "none", color: "#888", fontSize: "0.75rem" }}>
@@ -1042,7 +2339,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                 <div className="input-group">
                   <label htmlFor="id-uni">ID UNIDAD</label>
-                  <input type="text" id="id-uni" placeholder={unitId} />
+                  <input type="text" id="id-uni" placeholder={mqttUnitId} autoComplete="off" />
                 </div>
                 <div className="input-group">
                   <label htmlFor="tok-uni">TOKEN API</label>
@@ -1077,17 +2374,6 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
             </button>
           </div>
         </div>
-
-        <p
-          id="log"
-          style={{
-            textAlign: "center",
-            fontSize: "0.8rem",
-            color: "var(--verde)",
-            fontWeight: "bold",
-            minHeight: "1em",
-          }}
-        />
       </div>
     </div>
   );
