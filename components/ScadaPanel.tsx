@@ -21,7 +21,12 @@ import {
   parseLogLine,
   type LogsByDay,
 } from "@/lib/caja-negra";
-import { type PlcConfigJson, fetchPlcConfig, getEspOrigin, getPlcConfigOrigin } from "@/lib/esp-api";
+import {
+  type PlcConfigJson,
+  fetchPlcConfig,
+  getPlcConfigOrigin,
+  resolveEspLanOrigin,
+} from "@/lib/esp-api";
 import { buildMqttWebSocketUrl, cmdTopic, telemetryTopic } from "@/lib/omnitec-mqtt";
 import {
   mqttPayloadApagadoMin,
@@ -394,7 +399,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   /** Origen HTTP para GET /api/config (CONFIG_ORIGIN o ESP_ORIGIN). */
   const configOrigin = useMemo(() => getPlcConfigOrigin(), []);
   /** Origen del AP del equipo (OTA, logs, lógica) — mismo host que el ESP en LAN. */
-  const espLanOrigin = useMemo(() => getEspOrigin(), []);
+  const espLanOrigin = useMemo(() => resolveEspLanOrigin(), []);
   const [plcConfig, setPlcConfig] = useState<PlcConfigJson | null>(null);
   /** Evita pisar inputs mientras el usuario edita; fuera de foco se reflejan cambios del PLC vía MQTT. */
   const [liveFieldFocus, setLiveFieldFocus] = useState<string | null>(null);
@@ -1750,22 +1755,24 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
             </button>{" "}
             o la red local.
           </p>
-          {espLanOrigin || configOrigin ? (
-            <form
-              method="POST"
-              encType="multipart/form-data"
-              action={`${(espLanOrigin ?? configOrigin)!.replace(/\/$/, "")}/update`}
-              target="_blank"
-              style={{ display: "flex", flexDirection: "column", gap: 12 }}
-            >
-              <input type="file" name="update" accept=".bin" required style={{ background: "#222", color: "white" }} />
-              <button type="submit" className="boton btn-azul">
-                INICIAR ACTUALIZACIÓN
-              </button>
-            </form>
-          ) : (
-            <p style={{ color: "var(--rojo)", fontSize: "0.85rem" }}>Configure NEXT_PUBLIC_OMNITEC_ESP_ORIGIN.</p>
-          )}
+          <p style={{ color: "#666", fontSize: "0.72rem", marginBottom: 8 }}>
+            Destino OTA: <code style={{ color: "var(--cyan)" }}>{espLanOrigin}</code>
+            {configOrigin && configOrigin !== espLanOrigin ? (
+              <> · config API: {configOrigin}</>
+            ) : null}
+          </p>
+          <form
+            method="POST"
+            encType="multipart/form-data"
+            action={`${espLanOrigin.replace(/\/$/, "")}/update`}
+            target="_blank"
+            style={{ display: "flex", flexDirection: "column", gap: 12 }}
+          >
+            <input type="file" name="update" accept=".bin" required style={{ background: "#222", color: "white" }} />
+            <button type="submit" className="boton btn-azul">
+              INICIAR ACTUALIZACIÓN
+            </button>
+          </form>
           <button type="button" className="boton btn-gris" style={{ marginTop: 12 }} onClick={() => setOtaOpen(false)}>
             CANCELAR
           </button>

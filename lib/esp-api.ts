@@ -4,11 +4,22 @@
 
 const trim = (s: string | undefined) => s?.trim() ?? "";
 
-/** Origen HTTP del PLC, p. ej. http://192.168.4.1 — sin barra final */
+/** AP por defecto del ESP32 en modo configuración (Arduino / OMNIPRO típico). */
+export const DEFAULT_ESP_AP_ORIGIN = "http://192.168.4.1";
+
+/** Origen HTTP del PLC desde env, p. ej. http://192.168.4.1 — sin barra final; null si no está definido. */
 export function getEspOrigin(): string | null {
   if (typeof process === "undefined") return null;
   const o = trim(process.env.NEXT_PUBLIC_OMNITEC_ESP_ORIGIN);
   return o ? o.replace(/\/$/, "") : null;
+}
+
+/**
+ * Origen para OTA / abrir AP: usa NEXT_PUBLIC_OMNITEC_ESP_ORIGIN o, si falta, el AP por defecto.
+ * Así el formulario /update no queda roto sin .env (en LAN suele ser 192.168.4.1).
+ */
+export function resolveEspLanOrigin(): string {
+  return getEspOrigin() ?? DEFAULT_ESP_AP_ORIGIN;
 }
 
 /**
