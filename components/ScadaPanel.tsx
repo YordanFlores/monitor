@@ -445,14 +445,29 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     pinRef.current = pin;
   }, [pin]);
 
-  /** Caja negra vía MQTT (`cn`): solo si no cargamos historial completo del servidor; no pisar con parseo vacío. */
+  /** Caja negra vía MQTT (`cn`): mezclar con historial cargado para ver cambios en vivo sin refrescar. */
   useEffect(() => {
-    if (cajaFromServerRef.current) return;
     const lines = tel?.cn;
     if (!lines?.length) return;
     const grouped = groupLogsByDay(lines.join("\n"));
     if (Object.keys(grouped).length === 0) return;
-    setCajaGrouped(grouped);
+    setCajaGrouped((prev) => {
+      if (!prev || Object.keys(prev).length === 0) return grouped;
+      const next: LogsByDay = { ...prev };
+      for (const [day, rows] of Object.entries(grouped)) {
+        const base = next[day] ?? [];
+        const merged = [...rows, ...base];
+        const seen = new Set<string>();
+        next[day] = merged.filter((x) => {
+          const k = `${x.time}||${x.event}`.trim();
+          if (!k) return false;
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+      }
+      return next;
+    });
   }, [tel]);
 
   useEffect(() => {
