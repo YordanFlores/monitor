@@ -364,6 +364,11 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   const [cineOpen, setCineOpen] = useState(false);
   const [otaOpen, setOtaOpen] = useState(false);
   const [otaBusy, setOtaBusy] = useState(false);
+  const [logoUploadBusy, setLogoUploadBusy] = useState(false);
+  const [logoNombreArchivo, setLogoNombreArchivo] = useState("Ningún archivo seleccionado");
+  /** PIN usado al desbloquear config avanzada — para /authLogin en el ESP al subir logo. */
+  const pinRef = useRef("");
+  const espAuthPinRef = useRef("");
   const [chartOpen, setChartOpen] = useState(false);
   const [downloadOpen, setDownloadOpen] = useState(false);
   const [rtcOpen, setRtcOpen] = useState(false);
@@ -428,6 +433,10 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   useEffect(() => {
     telRef.current = tel;
   }, [tel]);
+
+  useEffect(() => {
+    pinRef.current = pin;
+  }, [pin]);
 
   /** Caja negra vía MQTT (`cn`): solo si no cargamos historial completo del servidor; no pisar con parseo vacío. */
   useEffect(() => {
@@ -545,6 +554,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       }
       if (pendingPinCheck.current) {
         pendingPinCheck.current = false;
+        espAuthPinRef.current = pinRef.current;
         const bloqueo = document.getElementById("panel-bloqueo");
         const edicion = document.getElementById("panel-edicion");
         if (bloqueo) bloqueo.style.display = "none";
@@ -662,6 +672,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     }
     if (pendingPinCheck.current && (rawPinFromESP === pin || d.pinCheckOk)) {
       pendingPinCheck.current = false;
+      espAuthPinRef.current = pinRef.current;
       if (pinCheckTimerRef.current) {
         clearTimeout(pinCheckTimerRef.current);
         pinCheckTimerRef.current = null;
@@ -1003,6 +1014,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     if (pinCheckTimerRef.current) clearTimeout(pinCheckTimerRef.current);
 
     if (rawPinFromESP !== "" && pin === rawPinFromESP) {
+      espAuthPinRef.current = pin;
       const bloqueo = document.getElementById("panel-bloqueo");
       const edicion = document.getElementById("panel-edicion");
       if (bloqueo) bloqueo.style.display = "none";
@@ -1022,7 +1034,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     pinCheckTimerRef.current = setTimeout(() => {
       if (pendingPinCheck.current) {
         pendingPinCheck.current = false;
-        showLog("PIN ERROR", "var(--rojo)");
+        showLog("PIN INCORRECTO", "var(--rojo)");
         setPin("");
       }
     }, 4000);
@@ -1264,6 +1276,97 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       showLog(e instanceof Error ? e.message : String(e), "var(--rojo)");
     } finally {
       setOtaBusy(false);
+    }
+  }
+
+  async function subirFondoPantallaFisica(file: File | undefined) {
+    if (!file) return;
+    const base = espLanOrigin?.trim();
+    if (!base) {
+      showLog("Configure NEXT_PUBLIC_OMNITEC_ESP_ORIGIN (URL del AP del equipo).", "var(--ambar)");
+      return;
+    }
+    const pinEsp = espAuthPinRef.current.trim() || rawPinFromESP.trim();
+    if (!pinEsp) {
+      showLog(
+        "Use ENTRAR con el PIN del equipo antes de subir el fondo, o espere telemetría con el PIN.",
+        "var(--ambar)",
+      );
+      return;
+    }
+    setLogoUploadBusy(true);
+    try {
+      showLog("SUBIENDO FONDO TFT…", "var(--ambar)");
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error("No se pudo leer el archivo"));
+        reader.readAsDataURL(file);
+      });
+
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = () => reject(new Error("Imagen no válida"));
+        image.src = dataUrl;
+      });
+
+      const cvs = document.createElement("canvas");
+      cvs.width = 160;
+      cvs.height = 128;
+      const ctx = cvs.getContext("2d");
+      if (!ctx) throw new Error("Canvas no disponible");
+      ctx.fillStyle = "black";
+      ctx.fillRect(0, 0, 160, 128);
+      const scale = Math.min(160 / img.width, 128 / img.height);
+      const w = img.width * scale;
+      const h = img.height * scale;
+      const x = 160 / 2 - w / 2;
+      const y = 128 / 2 - h / 2;
+      ctx.drawImage(img, x, y, w, h);
+
+      const imgData = ctx.getImageData(0, 0, 160, 128).data;
+      const buffer = new ArrayBuffer(40960);
+      const view = new DataView(buffer);
+      let j = 0;
+      for (let i = 0; i < imgData.length; i += 4) {
+        const r = imgData[i]! >> 3;
+        const g = imgData[i + 1]! >> 2;
+        const b = imgData[i + 2]! >> 3;
+        const color = (r << 11) | (g << 5) | b;
+        view.setUint16(j, color, true);
+        j += 2;
+      }
+
+      const authRes = await fetch(`${base.replace(/\/$/, "")}/authLogin?pin=${encodeURIComponent(pinEsp)}`, {
+        method: "GET",
+        mode: "cors",
+      });
+      const authTxt = (await authRes.text()).trim();
+      if (!authRes.ok || authTxt !== "OK") {
+        throw new Error("PIN rechazado por el equipo o sin conexión al AP.");
+      }
+
+      const formData = new FormData();
+      formData.append("logo", new Blob([buffer], { type: "application/octet-stream" }), "logo.bin");
+      const upRes = await fetch(`${base.replace(/\/$/, "")}/api/upload_logo`, {
+        method: "POST",
+        body: formData,
+        mode: "cors",
+      });
+      const upTxt = (await upRes.text()).trim();
+      if (!upRes.ok || upTxt !== "OK") {
+        throw new Error(upTxt || `Error HTTP ${upRes.status}`);
+      }
+      showLog("FONDO PANTALLA FÍSICA ACTUALIZADO", "var(--verde)");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      showLog(
+        `${msg} Si falla por HTTPS/CORS, abra la web del equipo en la misma red (AP) y suba la imagen allí.`,
+        "var(--rojo)",
+      );
+    } finally {
+      setLogoUploadBusy(false);
     }
   }
 
@@ -2542,6 +2645,44 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               OTA y programador completo requieren alcanzar al ESP por LAN o abrir el AP (
               {espLanOrigin ?? configOrigin ?? "configure ESP_ORIGIN"}).
             </p>
+            <div className="input-group" style={{ marginBottom: 15 }}>
+              <label htmlFor="file-logo-esp">CAMBIAR FONDO PANTALLA FÍSICA (ESP)</label>
+              <input
+                id="file-logo-esp"
+                type="file"
+                accept="image/*"
+                disabled={logoUploadBusy}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  setLogoNombreArchivo(f?.name || "Ningún archivo seleccionado");
+                  e.target.value = "";
+                  void subirFondoPantallaFisica(f);
+                }}
+                style={{ display: "none" }}
+              />
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 10,
+                  padding: "10px 0",
+                  flexWrap: "wrap",
+                }}
+              >
+                <label
+                  htmlFor="file-logo-esp"
+                  className="boton btn-gris"
+                  style={{
+                    margin: 0,
+                    cursor: logoUploadBusy ? "not-allowed" : "pointer",
+                    opacity: logoUploadBusy ? 0.6 : 1,
+                  }}
+                >
+                  Seleccionar archivo
+                </label>
+                <span style={{ color: "var(--ambar)", fontSize: "0.95rem" }}>{logoNombreArchivo}</span>
+              </div>
+            </div>
             <div className="input-group" style={{ marginBottom: 15 }}>
               <label htmlFor="new-pin">CAMBIAR PIN</label>
               <input type="number" id="new-pin" placeholder="NUEVO PIN" />
