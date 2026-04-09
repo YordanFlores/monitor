@@ -394,6 +394,12 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
 
   const esperandoReset = useRef(false);
   const anguloTolva = useRef(0);
+  const anguloCompRef = useRef(0);
+  const tolvaTargetRef = useRef(0);
+  const compTargetRef = useRef(0);
+  const truckAnimRafRef = useRef<number | null>(null);
+  const truckBedElsRef = useRef<HTMLElement[]>([]);
+  const truckGateElsRef = useRef<HTMLElement[]>([]);
   const audioCtx = useRef<AudioContext | null>(null);
   const beepInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const isOperating = useRef(false);
@@ -823,6 +829,43 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   }, [cineOpen, ajustarPantalla]);
 
   useEffect(() => {
+    truckBedElsRef.current = Array.from(
+      document.querySelectorAll(".omnitec-scada .truck-bed-wrapper"),
+    ) as HTMLElement[];
+    truckGateElsRef.current = Array.from(
+      document.querySelectorAll(".omnitec-scada .truck-gate-wrapper"),
+    ) as HTMLElement[];
+
+    let last = performance.now();
+    const step = (now: number) => {
+      const dt = Math.max(0.001, (now - last) / 1000);
+      last = now;
+      const maxTolvaStep = 120 * dt; // deg/s
+      const maxCompStep = 220 * dt; // deg/s
+
+      const tDelta = tolvaTargetRef.current - anguloTolva.current;
+      if (Math.abs(tDelta) <= maxTolvaStep) anguloTolva.current = tolvaTargetRef.current;
+      else anguloTolva.current += Math.sign(tDelta) * maxTolvaStep;
+
+      const cDelta = compTargetRef.current - anguloCompRef.current;
+      if (Math.abs(cDelta) <= maxCompStep) anguloCompRef.current = compTargetRef.current;
+      else anguloCompRef.current += Math.sign(cDelta) * maxCompStep;
+
+      const t = anguloTolva.current.toFixed(1);
+      const c = anguloCompRef.current.toFixed(1);
+      for (const el of truckBedElsRef.current) el.style.transform = `rotate(${t}deg)`;
+      for (const el of truckGateElsRef.current) el.style.transform = `rotate(${c}deg)`;
+
+      truckAnimRafRef.current = requestAnimationFrame(step);
+    };
+    truckAnimRafRef.current = requestAnimationFrame(step);
+    return () => {
+      if (truckAnimRafRef.current != null) cancelAnimationFrame(truckAnimRafRef.current);
+      truckAnimRafRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     const d = tel;
     if (!d || !authenticated) return;
 
@@ -929,21 +972,14 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       }
 
       if (d.relays & 2) {
-        if (anguloTolva.current < 45) anguloTolva.current += VEL_7S;
+        tolvaTargetRef.current = 45;
       } else if (d.relays & 4) {
-        if (anguloTolva.current > 0) anguloTolva.current -= VEL_7S;
+        tolvaTargetRef.current = 0;
       }
       if (f === 0 || f === 3) {
-        if (anguloTolva.current > 0) anguloTolva.current -= VEL_7S * 2;
-        if (anguloTolva.current < 0) anguloTolva.current = 0;
+        tolvaTargetRef.current = 0;
       }
-
-      document.querySelectorAll(".omnitec-scada .truck-bed-wrapper").forEach((el) => {
-        (el as HTMLElement).style.transform = `rotate(${anguloTolva.current.toFixed(1)}deg)`;
-      });
-      document.querySelectorAll(".omnitec-scada .truck-gate-wrapper").forEach((el) => {
-        (el as HTMLElement).style.transform = `rotate(${angComp.toFixed(1)}deg)`;
-      });
+      compTargetRef.current = angComp;
     }
 
     const hC = document.getElementById("h-ciclos");
