@@ -363,6 +363,8 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   const [mqttConnected, setMqttConnected] = useState(false);
   const [cineOpen, setCineOpen] = useState(false);
   const [otaOpen, setOtaOpen] = useState(false);
+  /** HTTPS → no enviar formularios a http://ESP (el navegador advierte o bloquea); OTA en pestaña HTTP. */
+  const [pageIsHttps, setPageIsHttps] = useState(false);
   const [chartOpen, setChartOpen] = useState(false);
   const [downloadOpen, setDownloadOpen] = useState(false);
   const [rtcOpen, setRtcOpen] = useState(false);
@@ -427,6 +429,10 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   useEffect(() => {
     telRef.current = tel;
   }, [tel]);
+
+  useEffect(() => {
+    setPageIsHttps(typeof window !== "undefined" && window.location.protocol === "https:");
+  }, []);
 
   /** Caja negra vía MQTT (`cn`): solo si no cargamos historial completo del servidor; no pisar con parseo vacío. */
   useEffect(() => {
@@ -1209,6 +1215,11 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     window.open(url, "_blank", "noopener,noreferrer");
   }
 
+  function abrirPaginaOtaEsp() {
+    const u = `${espLanOrigin.replace(/\/$/, "")}/update`;
+    window.open(u, "_blank", "noopener,noreferrer");
+  }
+
   async function loadCajaNegraLogs() {
     setCajaLoading(true);
     try {
@@ -1747,32 +1758,47 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
           }}
         >
           <h2 style={{ border: "none", marginTop: 0 }}>ACTUALIZAR SISTEMA</h2>
-          <p style={{ color: "#888", fontSize: "0.8rem" }}>
-            Subida directa al ESP (mismo esquema que el AP). Si esta página es HTTPS y el equipo es HTTP, el
-            navegador puede bloquear el envío: use el AP en{" "}
-            <button type="button" className="boton btn-azul" style={{ padding: "4px 8px" }} onClick={() => abrirEspLocal()}>
-              nueva pestaña
-            </button>{" "}
-            o la red local.
-          </p>
-          <p style={{ color: "#666", fontSize: "0.72rem", marginBottom: 8 }}>
-            Destino OTA: <code style={{ color: "var(--cyan)" }}>{espLanOrigin}</code>
+          <p style={{ color: "#666", fontSize: "0.72rem", marginBottom: 10 }}>
+            Equipo: <code style={{ color: "var(--cyan)" }}>{espLanOrigin}</code>
             {configOrigin && configOrigin !== espLanOrigin ? (
-              <> · config API: {configOrigin}</>
+              <> · config: {configOrigin}</>
             ) : null}
           </p>
-          <form
-            method="POST"
-            encType="multipart/form-data"
-            action={`${espLanOrigin.replace(/\/$/, "")}/update`}
-            target="_blank"
-            style={{ display: "flex", flexDirection: "column", gap: 12 }}
-          >
-            <input type="file" name="update" accept=".bin" required style={{ background: "#222", color: "white" }} />
-            <button type="submit" className="boton btn-azul">
-              INICIAR ACTUALIZACIÓN
-            </button>
-          </form>
+          {pageIsHttps ? (
+            <>
+              <p style={{ color: "#ccc", fontSize: "0.82rem", lineHeight: 1.45, marginBottom: 14 }}>
+                Esta web está en <strong>HTTPS</strong> y el ESP usa <strong>HTTP</strong>. El navegador no permite
+                enviar el archivo desde aquí (aviso de “conexión no segura”). Abra la página de actualización del
+                equipo en una pestaña nueva y suba el <code>.bin</code> allí.
+              </p>
+              <button type="button" className="boton btn-azul" style={{ width: "100%" }} onClick={abrirPaginaOtaEsp}>
+                ABRIR ACTUALIZACIÓN EN EL EQUIPO
+              </button>
+              <p style={{ color: "#666", fontSize: "0.72rem", marginTop: 10 }}>
+                Debe estar en la misma red que el ESP (WiFi del equipo o LAN). Si la IP no es la correcta, configure{" "}
+                <code style={{ color: "var(--ambar)" }}>NEXT_PUBLIC_OMNITEC_ESP_ORIGIN</code>.
+              </p>
+            </>
+          ) : (
+            <>
+              <p style={{ color: "#888", fontSize: "0.8rem", marginBottom: 12 }}>
+                Subida directa al ESP (misma red que el AP). Si la IP del equipo no es la de abajo, ajuste la variable
+                de entorno.
+              </p>
+              <form
+                method="POST"
+                encType="multipart/form-data"
+                action={`${espLanOrigin.replace(/\/$/, "")}/update`}
+                target="_blank"
+                style={{ display: "flex", flexDirection: "column", gap: 12 }}
+              >
+                <input type="file" name="update" accept=".bin" required style={{ background: "#222", color: "white" }} />
+                <button type="submit" className="boton btn-azul">
+                  INICIAR ACTUALIZACIÓN
+                </button>
+              </form>
+            </>
+          )}
           <button type="button" className="boton btn-gris" style={{ marginTop: 12 }} onClick={() => setOtaOpen(false)}>
             CANCELAR
           </button>
