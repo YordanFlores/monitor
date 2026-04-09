@@ -27,7 +27,7 @@ import {
   getPlcConfigOrigin,
   resolveEspLanOrigin,
 } from "@/lib/esp-api";
-import { buildMqttWebSocketUrl, cmdTopic, otaTopic, telemetryTopic } from "@/lib/omnitec-mqtt";
+import { buildMqttWebSocketUrl, cmdTopic, logoTopic, otaTopic, telemetryTopic } from "@/lib/omnitec-mqtt";
 import {
   mqttPayloadApagadoMin,
   mqttPayloadIdentidad,
@@ -1281,22 +1281,14 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
 
   async function subirFondoPantallaFisica(file: File | undefined) {
     if (!file) return;
-    const base = espLanOrigin?.trim();
-    if (!base) {
-      showLog("Configure NEXT_PUBLIC_OMNITEC_ESP_ORIGIN (URL del AP del equipo).", "var(--ambar)");
-      return;
-    }
-    const pinEsp = espAuthPinRef.current.trim() || rawPinFromESP.trim();
-    if (!pinEsp) {
-      showLog(
-        "Use ENTRAR con el PIN del equipo antes de subir el fondo, o espere telemetría con el PIN.",
-        "var(--ambar)",
-      );
+    const c = clientRef.current;
+    if (!c?.connected) {
+      showLog("MQTT no conectado: no se puede enviar el cambio de fondo.", "var(--rojo)");
       return;
     }
     setLogoUploadBusy(true);
     try {
-      showLog("SUBIENDO FONDO TFT…", "var(--ambar)");
+      showLog("SUBIENDO FONDO AL SERVIDOR…", "var(--ambar)");
       const dataUrl = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => resolve(String(reader.result));
@@ -1338,33 +1330,32 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         j += 2;
       }
 
-      const authRes = await fetch(`${base.replace(/\/$/, "")}/authLogin?pin=${encodeURIComponent(pinEsp)}`, {
-        method: "GET",
-        mode: "cors",
-      });
-      const authTxt = (await authRes.text()).trim();
-      if (!authRes.ok || authTxt !== "OK") {
-        throw new Error("PIN rechazado por el equipo o sin conexión al AP.");
-      }
-
       const formData = new FormData();
-      formData.append("logo", new Blob([buffer], { type: "application/octet-stream" }), "logo.bin");
-      const upRes = await fetch(`${base.replace(/\/$/, "")}/api/upload_logo`, {
+      formData.append("file", new Blob([buffer], { type: "application/octet-stream" }), "logo.bin");
+      const secret =
+        typeof process !== "undefined"
+          ? process.env.NEXT_PUBLIC_OMNITEC_FIRMWARE_UPLOAD_SECRET?.trim() ?? ""
+          : "";
+      const upRes = await fetch(`/api/logo/upload?unit=${encodeURIComponent(mqttUnitId.trim() || "latest")}`, {
         method: "POST",
         body: formData,
-        mode: "cors",
+        headers: secret ? { "x-firmware-upload-secret": secret } : undefined,
       });
-      const upTxt = (await upRes.text()).trim();
-      if (!upRes.ok || upTxt !== "OK") {
-        throw new Error(upTxt || `Error HTTP ${upRes.status}`);
+      const data = (await upRes.json().catch(() => ({}))) as {
+        ok?: boolean;
+        url?: string;
+        error?: string;
+      };
+      if (!upRes.ok || !data.ok || !data.url) {
+        throw new Error(data.error || `Error al guardar el fondo (${upRes.status})`);
       }
-      showLog("FONDO PANTALLA FÍSICA ACTUALIZADO", "var(--verde)");
+      const topic = logoTopic(mqttUnitId.trim() || "latest");
+      c.publish(topic, JSON.stringify({ url: data.url }), { qos: 1 });
+      showLog(`FONDO ENVIADO: el equipo descargará la imagen por MQTT (${topic})`, "var(--verde)");
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      showLog(
-        `${msg} Si falla por HTTPS/CORS, abra la web del equipo en la misma red (AP) y suba la imagen allí.`,
-        "var(--rojo)",
-      );
+      const rawMsg = e instanceof Error ? e.message : String(e);
+      const msg = /failed to fetch/i.test(rawMsg) || /networkerror/i.test(rawMsg) ? "Error de red al subir el fondo." : rawMsg;
+      showLog(msg, "var(--rojo)");
     } finally {
       setLogoUploadBusy(false);
     }

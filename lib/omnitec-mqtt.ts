@@ -57,3 +57,8 @@ export function cmdTopic(unitId: string) {
 export function otaTopic(unitId: string) {
   return `omnitec/ota/${unitId}`;
 }
+
+/** Fondo TFT por pull: el ESP recibe URL HTTPS del logo.bin (RGB565 160x128). */
+export function logoTopic(unitId: string) {
+  return `omnitec/logo/${unitId}`;
+}
