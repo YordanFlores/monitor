@@ -52,3 +52,8 @@ export function telemetryTopic(unitId: string) {
 export function cmdTopic(unitId: string) {
   return `omnitec/cmd/${unitId}`;
 }
+
+/** OTA por pull: el ESP se suscribe a este tópico y recibe la URL HTTPS del .bin. */
+export function otaTopic(unitId: string) {
+  return `omnitec/ota/${unitId}`;
+}

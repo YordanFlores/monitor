@@ -27,7 +27,7 @@ import {
   getPlcConfigOrigin,
   resolveEspLanOrigin,
 } from "@/lib/esp-api";
-import { buildMqttWebSocketUrl, cmdTopic, telemetryTopic } from "@/lib/omnitec-mqtt";
+import { buildMqttWebSocketUrl, cmdTopic, otaTopic, telemetryTopic } from "@/lib/omnitec-mqtt";
 import {
   mqttPayloadApagadoMin,
   mqttPayloadIdentidad,
@@ -363,8 +363,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   const [mqttConnected, setMqttConnected] = useState(false);
   const [cineOpen, setCineOpen] = useState(false);
   const [otaOpen, setOtaOpen] = useState(false);
-  /** HTTPS → no enviar formularios a http://ESP (el navegador advierte o bloquea); OTA en pestaña HTTP. */
-  const [pageIsHttps, setPageIsHttps] = useState(false);
+  const [otaBusy, setOtaBusy] = useState(false);
   const [chartOpen, setChartOpen] = useState(false);
   const [downloadOpen, setDownloadOpen] = useState(false);
   const [rtcOpen, setRtcOpen] = useState(false);
@@ -429,10 +428,6 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   useEffect(() => {
     telRef.current = tel;
   }, [tel]);
-
-  useEffect(() => {
-    setPageIsHttps(typeof window !== "undefined" && window.location.protocol === "https:");
-  }, []);
 
   /** Caja negra vía MQTT (`cn`): solo si no cargamos historial completo del servidor; no pisar con parseo vacío. */
   useEffect(() => {
@@ -1220,6 +1215,58 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     window.open(u, "_blank", "noopener,noreferrer");
   }
 
+  async function enviarOtaPorPullMqtt() {
+    const input = document.getElementById("ota-bin-input") as HTMLInputElement | null;
+    const file = input?.files?.[0];
+    if (!file) {
+      showLog("Seleccione un archivo .bin", "var(--ambar)");
+      return;
+    }
+    if (!file.name.toLowerCase().endsWith(".bin")) {
+      showLog("El firmware debe ser un archivo .bin", "var(--ambar)");
+      return;
+    }
+    const c = clientRef.current;
+    if (!c?.connected) {
+      showLog("MQTT no conectado: no se puede enviar la URL OTA.", "var(--rojo)");
+      return;
+    }
+    setOtaBusy(true);
+    try {
+      const fd = new FormData();
+      fd.append("file", file);
+      const secret =
+        typeof process !== "undefined"
+          ? process.env.NEXT_PUBLIC_OMNITEC_FIRMWARE_UPLOAD_SECRET?.trim() ?? ""
+          : "";
+      const res = await fetch(
+        `/api/firmware/upload?unit=${encodeURIComponent(mqttUnitId.trim() || "latest")}`,
+        {
+          method: "POST",
+          body: fd,
+          headers: secret ? { "x-firmware-upload-secret": secret } : undefined,
+        },
+      );
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        url?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.ok || !data.url) {
+        showLog(data.error || `Error al guardar el firmware (${res.status})`, "var(--rojo)");
+        return;
+      }
+      const topic = otaTopic(mqttUnitId.trim() || "latest");
+      c.publish(topic, JSON.stringify({ url: data.url }), { qos: 1 });
+      showLog(`OTA: firmware en servidor; orden enviada por MQTT (${topic})`, "var(--verde)");
+      setOtaOpen(false);
+    } catch (e) {
+      showLog(e instanceof Error ? e.message : String(e), "var(--rojo)");
+    } finally {
+      setOtaBusy(false);
+    }
+  }
+
   async function loadCajaNegraLogs() {
     setCajaLoading(true);
     try {
@@ -1759,46 +1806,52 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         >
           <h2 style={{ border: "none", marginTop: 0 }}>ACTUALIZAR SISTEMA</h2>
           <p style={{ color: "#666", fontSize: "0.72rem", marginBottom: 10 }}>
-            Equipo: <code style={{ color: "var(--cyan)" }}>{espLanOrigin}</code>
+            Unidad MQTT: <code style={{ color: "var(--cyan)" }}>{mqttUnitId}</code>
+            {" · "}
+            LAN: <code style={{ color: "var(--cyan)" }}>{espLanOrigin}</code>
             {configOrigin && configOrigin !== espLanOrigin ? (
               <> · config: {configOrigin}</>
             ) : null}
           </p>
-          {pageIsHttps ? (
-            <>
-              <p style={{ color: "#ccc", fontSize: "0.82rem", lineHeight: 1.45, marginBottom: 14 }}>
-                Esta web está en <strong>HTTPS</strong> y el ESP usa <strong>HTTP</strong>. El navegador no permite
-                enviar el archivo desde aquí (aviso de “conexión no segura”). Abra la página de actualización del
-                equipo en una pestaña nueva y suba el <code>.bin</code> allí.
+          <p style={{ color: "#ccc", fontSize: "0.82rem", lineHeight: 1.45, marginBottom: 14 }}>
+            El <code>.bin</code> se sube a este servidor (HTTPS) y luego se envía la URL al ESP por MQTT (
+            <code style={{ color: "var(--ambar)" }}>omnitec/ota/{"{unidad}"}</code>
+            ). El equipo debe tener Internet y MQTT; no hace falta abrir la web del AP para OTA.
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12, textAlign: "left" }}>
+            <input
+              id="ota-bin-input"
+              type="file"
+              accept=".bin"
+              disabled={otaBusy}
+              style={{ background: "#222", color: "white" }}
+            />
+            <button
+              type="button"
+              className="boton btn-azul"
+              style={{ width: "100%" }}
+              disabled={otaBusy || !mqttConnected}
+              onClick={() => void enviarOtaPorPullMqtt()}
+            >
+              {otaBusy ? "SUBIENDO…" : "SUBIR FIRMWARE Y ENVIAR OTA POR MQTT"}
+            </button>
+            {!mqttConnected ? (
+              <p style={{ color: "var(--rojo)", fontSize: "0.75rem", margin: 0 }}>
+                Sin conexión al broker MQTT: espere la conexión o revise la configuración WebSocket.
               </p>
-              <button type="button" className="boton btn-azul" style={{ width: "100%" }} onClick={abrirPaginaOtaEsp}>
-                ABRIR ACTUALIZACIÓN EN EL EQUIPO
-              </button>
-              <p style={{ color: "#666", fontSize: "0.72rem", marginTop: 10 }}>
-                Debe estar en la misma red que el ESP (WiFi del equipo o LAN). Si la IP no es la correcta, configure{" "}
-                <code style={{ color: "var(--ambar)" }}>NEXT_PUBLIC_OMNITEC_ESP_ORIGIN</code>.
-              </p>
-            </>
-          ) : (
-            <>
-              <p style={{ color: "#888", fontSize: "0.8rem", marginBottom: 12 }}>
-                Subida directa al ESP (misma red que el AP). Si la IP del equipo no es la de abajo, ajuste la variable
-                de entorno.
-              </p>
-              <form
-                method="POST"
-                encType="multipart/form-data"
-                action={`${espLanOrigin.replace(/\/$/, "")}/update`}
-                target="_blank"
-                style={{ display: "flex", flexDirection: "column", gap: 12 }}
-              >
-                <input type="file" name="update" accept=".bin" required style={{ background: "#222", color: "white" }} />
-                <button type="submit" className="boton btn-azul">
-                  INICIAR ACTUALIZACIÓN
-                </button>
-              </form>
-            </>
-          )}
+            ) : null}
+          </div>
+          <p style={{ color: "#666", fontSize: "0.72rem", marginTop: 14, marginBottom: 6 }}>
+            Opcional (misma red que el ESP): actualización clásica por HTTP al AP.
+          </p>
+          <button
+            type="button"
+            className="boton btn-gris"
+            style={{ width: "100%" }}
+            onClick={abrirPaginaOtaEsp}
+          >
+            ABRIR /update EN EL EQUIPO (LAN)
+          </button>
           <button type="button" className="boton btn-gris" style={{ marginTop: 12 }} onClick={() => setOtaOpen(false)}>
             CANCELAR
           </button>
