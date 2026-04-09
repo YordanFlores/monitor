@@ -494,6 +494,13 @@
   box-shadow: 0 0 0 1px rgba(255, 191, 0, 0.25);
 }
 
+/* Amarillo = modificado sin guardar (no se pisa con telemetría). */
+.omnitec-scada input.input-live-plc.input-live-dirty {
+  color: var(--ambar);
+  border-color: var(--ambar);
+  box-shadow: 0 0 0 1px rgba(255, 191, 0, 0.25);
+}
+
 .omnitec-scada input::placeholder {
   color: #444;
   opacity: 1;

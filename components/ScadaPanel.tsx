@@ -70,6 +70,8 @@ export type Telemetry = {
   tb?: number;
   limC?: number;
   limM?: number;
+  /** Tiempo de apagado de pantalla en minutos (telemetría online). */
+  tpMin?: number;
   net?: boolean;
   silenciada?: boolean;
   pin?: string;
@@ -203,6 +205,7 @@ function normalizeLiveTelemetry(raw: Record<string, unknown>): Telemetry {
     tb: optNum(raw, "tb"),
     limC: optNum(raw, "limC"),
     limM: optNum(raw, "limM"),
+    tpMin: optNum(raw, "tpMin"),
     net: raw.net !== undefined ? asBool(raw.net) : undefined,
     silenciada: raw.silenciada !== undefined ? asBool(raw.silenciada) : undefined,
     pin,
@@ -407,9 +410,13 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   /** Origen del AP del equipo (OTA, logs, lógica) — mismo host que el ESP en LAN. */
   const espLanOrigin = useMemo(() => resolveEspLanOrigin(), []);
   const [plcConfig, setPlcConfig] = useState<PlcConfigJson | null>(null);
+  const [plcConfigCache, setPlcConfigCache] = useState<Partial<PlcConfigJson> | null>(null);
   /** Evita pisar inputs mientras el usuario edita; fuera de foco se reflejan cambios del PLC vía MQTT. */
   const [liveFieldFocus, setLiveFieldFocus] = useState<string | null>(null);
   const telRef = useRef<Telemetry | null>(null);
+  /** Campos editados por el operador: no sobreescribir con telemetría hasta guardar. */
+  const [dirtyLiveFields, setDirtyLiveFields] = useState<Record<string, boolean>>({});
+  const cfgCacheKey = useMemo(() => `omnitec_plc_cfg_${mqttUnitId.trim() || "latest"}`, [mqttUnitId]);
   /** Agrupa setTel en un frame para no re-renderizar en cada mensaje MQTT (UI y PIN lentos). */
   const telFlushRafRef = useRef<number | null>(null);
   const pendingTelRef = useRef<Telemetry | null>(null);
@@ -451,6 +458,35 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   useEffect(() => {
     setMqttUnitId(unitId);
   }, [unitId]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(cfgCacheKey);
+      if (!raw) {
+        setPlcConfigCache(null);
+        return;
+      }
+      const parsed = JSON.parse(raw) as Partial<PlcConfigJson>;
+      setPlcConfigCache(parsed && typeof parsed === "object" ? parsed : null);
+    } catch {
+      setPlcConfigCache(null);
+    }
+  }, [cfgCacheKey]);
+
+  const persistPlcConfigCache = useCallback(
+    (next: Partial<PlcConfigJson>) => {
+      setPlcConfigCache((prev) => {
+        const merged = { ...(prev ?? {}), ...next };
+        try {
+          localStorage.setItem(cfgCacheKey, JSON.stringify(merged));
+        } catch {
+          /* ignore */
+        }
+        return merged;
+      });
+    },
+    [cfgCacheKey],
+  );
 
   useEffect(() => {
     cajaFromServerRef.current = false;
@@ -646,11 +682,12 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     void fetchPlcConfig(configOrigin).then((c) => {
       if (cancelled || !c) return;
       setPlcConfig(c);
+      persistPlcConfigCache(c);
     });
     return () => {
       cancelled = true;
     };
-  }, [authenticated, configOrigin]);
+  }, [authenticated, configOrigin, persistPlcConfigCache]);
 
   useEffect(() => {
     const d = tel;
@@ -908,7 +945,10 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       setLoginError("");
       if (configOrigin) {
         const cfg = await fetchPlcConfig(configOrigin);
-        if (cfg) setPlcConfig(cfg);
+        if (cfg) {
+          setPlcConfig(cfg);
+          persistPlcConfigCache(cfg);
+        }
       }
       return;
     }
@@ -928,7 +968,10 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       setLoginError("");
       if (configOrigin) {
         const cfg = await fetchPlcConfig(configOrigin);
-        if (cfg) setPlcConfig(cfg);
+        if (cfg) {
+          setPlcConfig(cfg);
+          persistPlcConfigCache(cfg);
+        }
       }
       return;
     }
@@ -1071,6 +1114,18 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     if (liveIds.has(ae.id)) ae.blur();
   }
 
+  function clearDirtyLiveFields(ids?: string[]) {
+    if (!ids || ids.length === 0) {
+      setDirtyLiveFields({});
+      return;
+    }
+    setDirtyLiveFields((prev) => {
+      const next = { ...prev };
+      for (const id of ids) delete next[id];
+      return next;
+    });
+  }
+
   function saveT() {
     const cs = readSecFromInputOrPh("in-cs", phCS);
     const cb = readSecFromInputOrPh("in-cb", phCB);
@@ -1086,6 +1141,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       showLog("SIN CONEXIÓN MQTT", "var(--rojo)");
       return;
     }
+    clearDirtyLiveFields(["in-cs", "in-cb", "in-ts", "in-tb"]);
     showLog("TIEMPOS GUARDADOS", "var(--verde)");
     blurLiveFieldIfFocused();
   }
@@ -1128,8 +1184,8 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     const lm = readSecFromInputOrPh("lim-m", phLM);
     const tp = readSecFromInputOrPh("t-apagado", phTP);
 
-    const idFallback = plcConfig?.id ?? mqttUnitId;
-    const tokFallback = plcConfig?.token ?? "";
+    const idFallback = plcConfig?.id ?? plcConfigCache?.id ?? mqttUnitId;
+    const tokFallback = plcConfig?.token ?? plcConfigCache?.token ?? "";
     const idEl = typeof document !== "undefined" ? (document.getElementById("id-uni") as HTMLInputElement | null) : null;
     const tokEl = typeof document !== "undefined" ? (document.getElementById("tok-uni") as HTMLInputElement | null) : null;
     const idTyped = idEl?.value?.trim() ?? "";
@@ -1151,6 +1207,14 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
 
     if (Number.isFinite(tp)) cmds.push(mqttPayloadApagadoMin(Math.round(tp as number)));
 
+    const draftCache: Partial<PlcConfigJson> = {};
+    if (Number.isFinite(lc)) draftCache.lc = Math.round(lc as number);
+    if (Number.isFinite(lm)) draftCache.lm = Math.round(lm as number);
+    if (Number.isFinite(tp)) draftCache.tp = String(tp);
+    if (idTyped) draftCache.id = idTyped;
+    if (tokTyped) draftCache.token = tokTyped;
+    if (Object.keys(draftCache).length > 0) persistPlcConfigCache(draftCache);
+
     if (cmds.length === 0) {
       showLog("NADA QUE GUARDAR", "var(--ambar)");
       bloquear();
@@ -1162,10 +1226,14 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         return;
       }
     }
+    clearDirtyLiveFields(["lim-c", "lim-m", "t-apagado", "id-uni", "tok-uni", "new-pin", "new-pin-mante"]);
     if (idTyped) setMqttUnitId(idTyped || idFallback);
     if (configOrigin) {
       void fetchPlcConfig(configOrigin).then((c) => {
-        if (c) setPlcConfig(c);
+        if (c) {
+          setPlcConfig(c);
+          persistPlcConfigCache(c);
+        }
       });
     }
     blurLiveFieldIfFocused();
@@ -1510,11 +1578,6 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   }
 
   async function procesarDescargaCsv() {
-    const base = espLanOrigin ?? configOrigin;
-    if (!base) {
-      showLog("Configure NEXT_PUBLIC_OMNITEC_ESP_ORIGIN.", "var(--ambar)");
-      return;
-    }
     if (dlTipo === "rango" && (!dlDesde || !dlHasta)) {
       showLog("SELECCIONE FECHAS", "var(--ambar)");
       return;
@@ -1526,24 +1589,54 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     setDownloadOpen(false);
     showLog("DESCARGANDO…", "var(--cyan)");
     try {
-      const res = await fetch(`${base.replace(/\/$/, "")}/api/download_log`, { cache: "no-store", credentials: "omit" });
-      const blob = await res.blob();
-      const text = await blob.text();
+      let text = "";
+
+      // 1) Historial persistido en el servidor Next (preferido).
+      const uid = mqttUnitId.trim();
+      if (uid) {
+        try {
+          const res = await fetch(`/api/unit-logs/${encodeURIComponent(uid)}`, { cache: "no-store" });
+          if (res.ok) {
+            const t = await res.text();
+            if (t.trim()) text = t;
+          }
+        } catch {
+          /* fallback */
+        }
+      }
+
+      // 2) Telemetría MQTT en memoria (cn[] reciente).
+      if (!text.trim()) {
+        const lines = telRef.current?.cn;
+        if (lines?.length) text = lines.join("\n");
+      }
+
+      // 3) AP local del equipo (si es alcanzable).
+      if (!text.trim()) {
+        const base = espLanOrigin ?? configOrigin;
+        if (base) {
+          try {
+            const res = await fetch(`${base.replace(/\/$/, "")}/api/download_log`, {
+              cache: "no-store",
+              credentials: "omit",
+            });
+            if (res.ok) {
+              const blob = await res.blob();
+              const t = await blob.text();
+              if (t.trim()) text = t;
+            }
+          } catch {
+            /* fallback */
+          }
+        }
+      }
+
       if (!text.trim()) {
         showLog("SIN DATOS", "var(--rojo)");
         return;
       }
-      if (dlTipo === "todo") {
-        const a = document.createElement("a");
-        a.href = URL.createObjectURL(new Blob(["\uFEFF" + text], { type: "text/csv;charset=utf-8" }));
-        a.download = "Historial_OMNITEC.csv";
-        a.click();
-        URL.revokeObjectURL(a.href);
-        showLog("DESCARGA LISTA", "var(--verde)");
-        return;
-      }
-      const start = new Date(`${dlDesde}T00:00:00`).getTime();
-      const end = new Date(`${dlHasta}T23:59:59`).getTime();
+      const start = dlTipo === "rango" ? new Date(`${dlDesde}T00:00:00`).getTime() : Number.NEGATIVE_INFINITY;
+      const end = dlTipo === "rango" ? new Date(`${dlHasta}T23:59:59`).getTime() : Number.POSITIVE_INFINITY;
       const lines = text.split("\n");
       const logsByDay: Record<string, string[]> = {};
       const dates: string[] = [];
@@ -1565,6 +1658,14 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         showLog("RANGO SIN DATOS", "var(--rojo)");
         return;
       }
+      dates.sort((a, b) => {
+        const pa = a.split("/");
+        const pb = b.split("/");
+        if (pa.length !== 3 || pb.length !== 3) return a.localeCompare(b);
+        const da = `20${pa[2]}-${pa[1]}-${pa[0]}`;
+        const db = `20${pb[2]}-${pb[1]}-${pb[0]}`;
+        return da.localeCompare(db);
+      });
       let csvOutput = `${dates.map((d) => `"${d}"`).join(";")}\n`;
       const maxRows = Math.max(...dates.map((d) => logsByDay[d].length));
       for (let i = 0; i < maxRows; i++) {
@@ -1572,7 +1673,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       }
       const a = document.createElement("a");
       a.href = URL.createObjectURL(new Blob(["\uFEFF" + csvOutput], { type: "text/csv;charset=utf-8" }));
-      a.download = "Reporte_Dinamico_OMNITEC.csv";
+      a.download = dlTipo === "todo" ? "Historial_OMNITEC_por_dia.csv" : "Reporte_Dinamico_OMNITEC.csv";
       a.click();
       URL.revokeObjectURL(a.href);
       showLog("DESCARGA EXITOSA", "var(--verde)");
@@ -1622,7 +1723,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       if (plcN !== undefined && plcN !== null && Number.isFinite(plcN)) return String(plcN);
       return "";
     }
-    const p = plcConfig;
+    const p = plcConfig ?? plcConfigCache;
     return {
       phCS: pickSec(tel?.tCS, tel?.cs, p?.cs),
       phCB: pickSec(tel?.tCB, tel?.cb, p?.cb),
@@ -1638,9 +1739,13 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         if (p && p.lm !== undefined && Number.isFinite(p.lm)) return String(p.lm);
         return "";
       })(),
-      phTP: p?.tp?.trim() ? p.tp : "",
+      phTP: (() => {
+        if (tel?.tpMin != null && Number.isFinite(tel.tpMin)) return String(tel.tpMin);
+        if (p?.tp?.trim()) return p.tp;
+        return "";
+      })(),
     };
-  }, [tel, plcConfig]);
+  }, [tel, plcConfig, plcConfigCache]);
 
   /** Reflejo en vivo desde telemetría/config (gris hasta que enfocas = modo AP: no interfiere hasta editar). */
   useEffect(() => {
@@ -1648,6 +1753,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       if (val === undefined || val === null || val === "" || val === "—") return;
       const el = document.getElementById(id) as HTMLInputElement | null;
       if (!el) return;
+      if (dirtyLiveFields[id]) return;
       if (document.activeElement === el || liveFieldFocus === id) return;
       el.value = val;
     };
@@ -1658,8 +1764,8 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     sync("lim-c", phLC);
     sync("lim-m", phLM);
     sync("t-apagado", phTP);
-    sync("id-uni", plcConfig?.id ?? mqttUnitId);
-    if (plcConfig?.token) sync("tok-uni", plcConfig.token);
+    sync("id-uni", plcConfig?.id ?? plcConfigCache?.id ?? mqttUnitId);
+    if (plcConfig?.token || plcConfigCache?.token) sync("tok-uni", plcConfig?.token ?? plcConfigCache?.token ?? "");
   }, [
     phCS,
     phCB,
@@ -1670,9 +1776,17 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     phTP,
     plcConfig?.id,
     plcConfig?.token,
+    plcConfigCache?.id,
+    plcConfigCache?.token,
     mqttUnitId,
     liveFieldFocus,
+    dirtyLiveFields,
   ]);
+
+  const liveClassName = useCallback(
+    (id: string) => (dirtyLiveFields[id] ? "input-live-plc input-live-dirty" : "input-live-plc"),
+    [dirtyLiveFields],
+  );
 
   const bindLiveField = useCallback((id: string) => {
     return {
@@ -1682,6 +1796,9 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         requestAnimationFrame(() => {
           el?.select();
         });
+      },
+      onChange: () => {
+        setDirtyLiveFields((prev) => (prev[id] ? prev : { ...prev, [id]: true }));
       },
       onBlur: () => setLiveFieldFocus((cur) => (cur === id ? null : cur)),
     };
@@ -2457,10 +2574,6 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               </button>
             </div>
           </div>
-          <p style={{ fontSize: "0.6rem", color: "#666", margin: "0 15px 8px", padding: "0 4px" }}>
-            Vista alineada al AP: por fecha, desplegable. Telemetría MQTT: hasta 40 líneas recientes; el historial
-            completo sigue en la SD / descarga por AP.
-          </p>
           <div className="acordeon-content" style={{ maxHeight: cajaOpen ? 380 : 0, overflow: "hidden", transition: "max-height 0.3s ease" }}>
             {cajaLoading ? (
               <p style={{ padding: 10, fontSize: "0.75rem" }}>Cargando…</p>
@@ -2525,7 +2638,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               <input
                 type="number"
                 id="in-cs"
-                className="input-live-plc"
+                className={liveClassName("in-cs")}
                 placeholder={phCS || "—"}
                 {...bindLiveField("in-cs")}
               />
@@ -2537,7 +2650,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               <input
                 type="number"
                 id="in-cb"
-                className="input-live-plc"
+                className={liveClassName("in-cb")}
                 placeholder={phCB || "—"}
                 {...bindLiveField("in-cb")}
               />
@@ -2549,7 +2662,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               <input
                 type="number"
                 id="in-ts"
-                className="input-live-plc"
+                className={liveClassName("in-ts")}
                 placeholder={phTS || "—"}
                 {...bindLiveField("in-ts")}
               />
@@ -2561,7 +2674,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               <input
                 type="number"
                 id="in-tb"
-                className="input-live-plc"
+                className={liveClassName("in-tb")}
                 placeholder={phTB || "—"}
                 {...bindLiveField("in-tb")}
               />
@@ -2692,7 +2805,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
                   <input
                     type="text"
                     id="id-uni"
-                    className="input-live-plc"
+                    className={liveClassName("id-uni")}
                     placeholder={mqttUnitId}
                     autoComplete="off"
                     {...bindLiveField("id-uni")}
@@ -2703,7 +2816,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
                   <input
                     type="text"
                     id="tok-uni"
-                    className="input-live-plc"
+                    className={liveClassName("tok-uni")}
                     placeholder="••••••"
                     {...bindLiveField("tok-uni")}
                   />
@@ -2720,7 +2833,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
                   <input
                     type="number"
                     id="lim-c"
-                    className="input-live-plc"
+                    className={liveClassName("lim-c")}
                     placeholder={phLC || "—"}
                     {...bindLiveField("lim-c")}
                   />
@@ -2730,7 +2843,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
                   <input
                     type="number"
                     id="lim-m"
-                    className="input-live-plc"
+                    className={liveClassName("lim-m")}
                     placeholder={phLM || "—"}
                     {...bindLiveField("lim-m")}
                   />
@@ -2741,7 +2854,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
                     type="number"
                     step={0.1}
                     id="t-apagado"
-                    className="input-live-plc"
+                    className={liveClassName("t-apagado")}
                     placeholder={phTP || "—"}
                     {...bindLiveField("t-apagado")}
                   />
