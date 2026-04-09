@@ -958,6 +958,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
 
     if (!d.plcM) {
       let angComp = 0;
+      let angTolvaTarget = 0;
       if (f === 0) {
         if (gt.tCS > 0) angComp = (d.ms / gt.tCS) * -90;
         if (angComp < -90) angComp = -90;
@@ -971,11 +972,37 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         }
       }
 
-      if (d.relays & 2) {
-        tolvaTargetRef.current = 45;
-      } else if (d.relays & 4) {
-        tolvaTargetRef.current = 0;
+      // Tolva respetando tiempos del ciclo (sube con tTS y baja con tTB).
+      if (f === 1) {
+        if (gt.tTS > 0) {
+          let pr = d.ms / gt.tTS;
+          if (pr > 1) pr = 1;
+          if (pr < 0) pr = 0;
+          angTolvaTarget = pr * 45;
+        } else {
+          angTolvaTarget = 45;
+        }
+      } else if (f === 2) {
+        if (gt.tTB > 0) {
+          let pr = d.ms / gt.tTB;
+          if (pr > 1) pr = 1;
+          if (pr < 0) pr = 0;
+          angTolvaTarget = 45 - pr * 45;
+        } else {
+          angTolvaTarget = 0;
+        }
+      } else {
+        angTolvaTarget = 0;
       }
+
+      // Fallback por relés (si el firmware reporta fase rara).
+      if (f < 0 && (d.relays & 2)) angTolvaTarget = 45;
+      if (f < 0 && (d.relays & 4)) angTolvaTarget = 0;
+
+      if (angTolvaTarget < 0) angTolvaTarget = 0;
+      if (angTolvaTarget > 45) angTolvaTarget = 45;
+      tolvaTargetRef.current = angTolvaTarget;
+
       if (f === 0 || f === 3) {
         tolvaTargetRef.current = 0;
       }
