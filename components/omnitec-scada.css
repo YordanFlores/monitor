@@ -87,7 +87,7 @@
   width: 1150px;
   height: 450px;
   z-index: 10;
-  background-image: url("/Chasis.svg");
+  background-image: url("/Chasis.png");
 }
 
 .omnitec-scada .truck-bed-wrapper {
@@ -105,7 +105,7 @@
 .omnitec-scada .truck-bed-img {
   width: 100%;
   height: 100%;
-  background-image: url("/tolva.svg");
+  background-image: url("/tolva.png");
   transform: rotate(-32deg);
 }
 
@@ -123,7 +123,7 @@
 .omnitec-scada .truck-gate-img {
   width: 100%;
   height: 100%;
-  background-image: url("/Compuerta.svg");
+  background-image: url("/Compuerta.png");
   transform: rotate(0deg);
 }
 
@@ -471,6 +471,27 @@
   text-align: center;
   box-sizing: border-box;
   margin-bottom: 10px;
+}
+
+/**
+ * Valores reflejados desde el PLC (telemetría MQTT): gris = solo lectura visual,
+ * no compiten con el foco; al enfocar pasan a ámbar como en el AP al editar.
+ */
+.omnitec-scada input.input-live-plc {
+  color: #888;
+  border-color: #2a2a2a;
+  font-weight: 600;
+}
+
+.omnitec-scada input.input-live-plc::placeholder {
+  color: #555;
+}
+
+.omnitec-scada input.input-live-plc:focus {
+  color: var(--ambar);
+  border-color: var(--ambar);
+  outline: none;
+  box-shadow: 0 0 0 1px rgba(255, 191, 0, 0.25);
 }
 
 .omnitec-scada input::placeholder {

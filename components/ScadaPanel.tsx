@@ -1,6 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  startTransition,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FocusEvent,
+  type MouseEvent,
+} from "react";
 import { useRouter } from "next/navigation";
 import mqtt, { type MqttClient } from "mqtt";
 import { drawActividadDiariaChart } from "@/lib/chart-actividad";
@@ -103,15 +112,26 @@ function asBool(v: unknown): boolean {
 
 /** Compatible con firmwares que usan distintos nombres (ver README). */
 function telemetryAuthOk(raw: Record<string, unknown>): boolean {
+  const cr = String(raw.checkPinResult ?? raw.checkResult ?? "").toLowerCase();
+  const res = String(raw.result ?? "").toLowerCase();
   return (
     asBool(raw.authOk) ||
     asBool(raw.loginOk) ||
     asBool(raw.sessionOk) ||
     asBool(raw.authLoginOk) ||
     asBool(raw.pinOk) ||
+    asBool(raw.checkPinOk) ||
+    asBool(raw.accessGranted) ||
+    asBool(raw.unlocked) ||
     asBool(raw.configUnlocked) ||
     String(raw.authResult ?? "").toUpperCase() === "OK" ||
-    String(raw.loginResult ?? "").toUpperCase() === "OK"
+    String(raw.loginResult ?? "").toUpperCase() === "OK" ||
+    String(raw.checkPin ?? "").toLowerCase() === "ok" ||
+    cr === "ok" ||
+    cr === "success" ||
+    res === "ok" ||
+    res === "success" ||
+    res === "pin_ok"
   );
 }
 
@@ -276,6 +296,7 @@ function parseMqttAck(buf: Buffer): { ok: true } | { ok: false; message: string 
   const t = buf.toString().trim();
   if (!t) return null;
   if (/^OK$/i.test(t)) return { ok: true };
+  if (/^(SUCCESS|TRUE|PIN_OK|PIN OK)$/i.test(t)) return { ok: true };
   const errPlain = t.match(/^ERROR\s*(.*)$/i);
   if (errPlain) {
     return { ok: false, message: errPlain[1]?.trim() || "PIN INCORRECTO" };
@@ -287,7 +308,14 @@ function parseMqttAck(buf: Buffer): { ok: true } | { ok: false; message: string 
       typeof raw.message === "string" && raw.message.trim()
         ? raw.message.trim()
         : "PIN INCORRECTO";
-    if (st === "OK" || raw.success === true || telemetryAuthOk(raw)) return { ok: true };
+    if (
+      st === "OK" ||
+      raw.success === true ||
+      telemetryAuthOk(raw) ||
+      asBool(raw.checkPinOk)
+    ) {
+      return { ok: true };
+    }
     if (st === "ERROR" || raw.success === false) return { ok: false, message: msg };
   } catch {
     /* ignore */
@@ -389,7 +417,14 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   /** Origen del AP del equipo (OTA, logs, lógica) — mismo host que el ESP en LAN. */
   const espLanOrigin = useMemo(() => getEspOrigin(), []);
   const [plcConfig, setPlcConfig] = useState<PlcConfigJson | null>(null);
+  /** Evita pisar inputs mientras el usuario edita; fuera de foco se reflejan cambios del PLC vía MQTT. */
+  const [liveFieldFocus, setLiveFieldFocus] = useState<string | null>(null);
   const telRef = useRef<Telemetry | null>(null);
+  /** Agrupa setTel en un frame para no re-renderizar en cada mensaje MQTT (UI y PIN lentos). */
+  const telFlushRafRef = useRef<number | null>(null);
+  const pendingTelRef = useRef<Telemetry | null>(null);
+  /** Si el historial vino de GET /api/unit-logs, no lo pisa la telemetría `cn` (suele ser más corta / otro formato). */
+  const cajaFromServerRef = useRef(false);
 
   const publishCmd = useCallback(
     (payload: Record<string, unknown>): boolean => {
@@ -409,16 +444,24 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     telRef.current = tel;
   }, [tel]);
 
-  /** Caja negra vía MQTT (`cn` en telemetría): no depende de /api/logs ni CORS. */
+  /** Caja negra vía MQTT (`cn`): solo si no cargamos historial completo del servidor; no pisar con parseo vacío. */
   useEffect(() => {
+    if (cajaFromServerRef.current) return;
     const lines = tel?.cn;
     if (!lines?.length) return;
-    setCajaGrouped(groupLogsByDay(lines.join("\n")));
+    const grouped = groupLogsByDay(lines.join("\n"));
+    if (Object.keys(grouped).length === 0) return;
+    setCajaGrouped(grouped);
   }, [tel]);
 
   useEffect(() => {
     setMqttUnitId(unitId);
   }, [unitId]);
+
+  useEffect(() => {
+    cajaFromServerRef.current = false;
+    setLiveFieldFocus(null);
+  }, [mqttUnitId]);
 
   useEffect(() => {
     if (mqttUnitId !== unitId) {
@@ -575,11 +618,22 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         }
         return;
       }
-      setTel(normalizeLiveTelemetry(raw));
+      pendingTelRef.current = normalizeLiveTelemetry(raw);
       if (raw.pin != null) setRawPinFromESP(String(raw.pin));
+      if (telFlushRafRef.current == null) {
+        telFlushRafRef.current = requestAnimationFrame(() => {
+          telFlushRafRef.current = null;
+          const next = pendingTelRef.current;
+          if (next) setTel(next);
+        });
+      }
     });
 
     return () => {
+      if (telFlushRafRef.current != null) {
+        cancelAnimationFrame(telFlushRafRef.current);
+        telFlushRafRef.current = null;
+      }
       setMqttConnected(false);
       client.end(true);
       clientRef.current = null;
@@ -606,7 +660,12 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   useEffect(() => {
     const d = tel;
     if (!d) return;
-    if (pendingAuth.current && (rawPinFromESP === pinLogin || d.authOk)) {
+    const pinMatch =
+      rawPinFromESP.trim() === pinLogin.trim() ||
+      (rawPinFromESP.trim().length > 0 &&
+        pinLogin.trim().length > 0 &&
+        rawPinFromESP.trim().padStart(4, "0") === pinLogin.trim().padStart(4, "0"));
+    if (pendingAuth.current && (pinMatch || d.authOk)) {
       pendingAuth.current = false;
       if (authTimerRef.current) {
         clearTimeout(authTimerRef.current);
@@ -891,7 +950,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         borrarPLog();
         setTimeout(() => setLoginError(""), 6000);
       }
-    }, 8000);
+    }, 15_000);
   }
 
   function abrirCine() {
@@ -991,6 +1050,30 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     if (edicion) edicion.style.display = "none";
   }
 
+  /** Evita blur→sync antes del click: sin esto, el efecto de telemetría restaura valores viejos y el guardado envía basura. */
+  function preventSubmitBlur(e: MouseEvent<HTMLButtonElement>) {
+    e.preventDefault();
+  }
+
+  /** Tras guardar, quitar foco para volver al estilo gris (input-live-plc) sin tener que clicar fuera. */
+  function blurLiveFieldIfFocused() {
+    if (typeof document === "undefined") return;
+    const ae = document.activeElement as HTMLElement | null;
+    if (!ae?.id) return;
+    const liveIds = new Set([
+      "in-cs",
+      "in-cb",
+      "in-ts",
+      "in-tb",
+      "lim-c",
+      "lim-m",
+      "t-apagado",
+      "id-uni",
+      "tok-uni",
+    ]);
+    if (liveIds.has(ae.id)) ae.blur();
+  }
+
   function saveT() {
     const cs = readSecFromInputOrPh("in-cs", phCS);
     const cb = readSecFromInputOrPh("in-cb", phCB);
@@ -1007,6 +1090,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       return;
     }
     showLog("TIEMPOS GUARDADOS", "var(--verde)");
+    blurLiveFieldIfFocused();
   }
 
   function togglePlcMode() {
@@ -1036,7 +1120,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       } else if (t && t.plcM === next) {
         showLog("MODO CONFIRMADO POR TELEMETRÍA", "var(--verde)");
       }
-    }, 4500);
+    }, 2200);
   }
 
   function guardarTodo() {
@@ -1087,6 +1171,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         if (c) setPlcConfig(c);
       });
     }
+    blurLiveFieldIfFocused();
     bloquear();
     showLog("GUARDADO", "var(--verde)");
   }
@@ -1141,51 +1226,72 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   }
 
   async function loadCajaNegraLogs() {
-    const uid = mqttUnitId.trim();
-    if (uid) {
-      setCajaLoading(true);
-      try {
-        const res = await fetch(`/api/unit-logs/${encodeURIComponent(uid)}`, {
-          cache: "no-store",
-        });
-        if (res.ok) {
-          const txt = await res.text();
-          if (txt.trim()) {
-            setCajaGrouped(groupLogsByDay(txt));
-            setCajaLoading(false);
-            return;
-          }
-        }
-      } catch {
-        /* usar MQTT o AP */
-      }
-    }
-    const fromMqtt = telRef.current?.cn;
-    if (fromMqtt && fromMqtt.length > 0) {
-      setCajaGrouped(groupLogsByDay(fromMqtt.join("\n")));
-      setCajaLoading(false);
-      return;
-    }
-    const base = espLanOrigin ?? configOrigin;
-    if (!base) {
-      showLog("Sin datos MQTT (cn) ni origen AP: actualice el firmware o configure NEXT_PUBLIC_OMNITEC_ESP_ORIGIN.", "var(--ambar)");
-      setCajaGrouped(null);
-      setCajaLoading(false);
-      return;
-    }
     setCajaLoading(true);
     try {
-      const res = await fetch(`${base.replace(/\/$/, "")}/api/logs`, { cache: "no-store", credentials: "omit" });
-      const txt = await res.text();
-      if (!txt.trim() || txt.includes("Sin registros")) {
-        setCajaGrouped({});
-        showLog("SIN REGISTROS EN EL EQUIPO", "var(--ambar)");
-      } else {
-        setCajaGrouped(groupLogsByDay(txt));
+      const uid = mqttUnitId.trim();
+      const quickCn = telRef.current?.cn;
+
+      if (quickCn?.length) {
+        cajaFromServerRef.current = false;
+        setCajaGrouped(groupLogsByDay(quickCn.join("\n")));
+        setCajaLoading(false);
       }
-    } catch {
-      setCajaGrouped(null);
-      showLog("NO SE PUDO LEER /api/logs (CORS o sesión AP). Con firmware actual, los datos llegan por MQTT (cn).", "var(--rojo)");
+
+      if (uid) {
+        const ac = new AbortController();
+        const tid = window.setTimeout(() => ac.abort(), 6000);
+        try {
+          const res = await fetch(`/api/unit-logs/${encodeURIComponent(uid)}`, {
+            cache: "no-store",
+            signal: ac.signal,
+          });
+          window.clearTimeout(tid);
+          if (res.ok) {
+            const txt = await res.text();
+            if (txt.trim()) {
+              cajaFromServerRef.current = true;
+              const apply = () => setCajaGrouped(groupLogsByDay(txt));
+              if (txt.length > 100_000) startTransition(apply);
+              else apply();
+              return;
+            }
+          }
+        } catch {
+          window.clearTimeout(tid);
+        }
+      }
+
+      if (quickCn?.length) {
+        return;
+      }
+
+      cajaFromServerRef.current = false;
+      const fromMqtt = telRef.current?.cn;
+      if (fromMqtt && fromMqtt.length > 0) {
+        setCajaGrouped(groupLogsByDay(fromMqtt.join("\n")));
+        return;
+      }
+      const base = espLanOrigin ?? configOrigin;
+      if (!base) {
+        showLog("Sin datos MQTT (cn) ni origen AP: actualice el firmware o configure NEXT_PUBLIC_OMNITEC_ESP_ORIGIN.", "var(--ambar)");
+        setCajaGrouped(null);
+        return;
+      }
+      try {
+        const res = await fetch(`${base.replace(/\/$/, "")}/api/logs`, { cache: "no-store", credentials: "omit" });
+        const txt = await res.text();
+        if (!txt.trim() || txt.includes("Sin registros")) {
+          setCajaGrouped({});
+          showLog("SIN REGISTROS EN EL EQUIPO", "var(--ambar)");
+        } else {
+          const apply = () => setCajaGrouped(groupLogsByDay(txt));
+          if (txt.length > 100_000) startTransition(apply);
+          else apply();
+        }
+      } catch {
+        setCajaGrouped(null);
+        showLog("NO SE PUDO LEER /api/logs (CORS o sesión AP). Con firmware actual, los datos llegan por MQTT (cn).", "var(--rojo)");
+      }
     } finally {
       setCajaLoading(false);
     }
@@ -1400,33 +1506,50 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     };
   }, [tel, plcConfig]);
 
-  /** Volcado suave a inputs vacíos (misma idea que cargarConfiguración / placeholders vivos en el ESP). */
+  /** Reflejo en vivo desde telemetría/config (gris hasta que enfocas = modo AP: no interfiere hasta editar). */
   useEffect(() => {
-    const put = (id: string, val: string) => {
-      if (!val || val === "—") return;
+    const sync = (id: string, val: string | undefined) => {
+      if (val === undefined || val === null || val === "" || val === "—") return;
       const el = document.getElementById(id) as HTMLInputElement | null;
-      if (!el || document.activeElement === el) return;
-      if (!el.value?.trim()) el.value = val;
+      if (!el) return;
+      if (document.activeElement === el || liveFieldFocus === id) return;
+      el.value = val;
     };
-    put("in-cs", phCS);
-    put("in-cb", phCB);
-    put("in-ts", phTS);
-    put("in-tb", phTB);
-  }, [phCS, phCB, phTS, phTB]);
+    sync("in-cs", phCS);
+    sync("in-cb", phCB);
+    sync("in-ts", phTS);
+    sync("in-tb", phTB);
+    sync("lim-c", phLC);
+    sync("lim-m", phLM);
+    sync("t-apagado", phTP);
+    sync("id-uni", plcConfig?.id ?? mqttUnitId);
+    if (plcConfig?.token) sync("tok-uni", plcConfig.token);
+  }, [
+    phCS,
+    phCB,
+    phTS,
+    phTB,
+    phLC,
+    phLM,
+    phTP,
+    plcConfig?.id,
+    plcConfig?.token,
+    mqttUnitId,
+    liveFieldFocus,
+  ]);
 
-  useEffect(() => {
-    const put = (id: string, val: string) => {
-      if (val === undefined || val === null) return;
-      const el = document.getElementById(id) as HTMLInputElement | null;
-      if (!el || document.activeElement === el) return;
-      if (!el.value?.trim()) el.value = val;
+  const bindLiveField = useCallback((id: string) => {
+    return {
+      onFocus: (e: FocusEvent<HTMLInputElement>) => {
+        setLiveFieldFocus(id);
+        const el = e.currentTarget;
+        requestAnimationFrame(() => {
+          el?.select();
+        });
+      },
+      onBlur: () => setLiveFieldFocus((cur) => (cur === id ? null : cur)),
     };
-    put("lim-c", phLC);
-    put("lim-m", phLM);
-    put("t-apagado", phTP);
-    put("id-uni", plcConfig?.id ?? mqttUnitId);
-    if (plcConfig?.token) put("tok-uni", plcConfig.token);
-  }, [phLC, phLM, phTP, plcConfig?.id, plcConfig?.token, mqttUnitId]);
+  }, []);
 
   return (
     <div className="omnitec-scada">
@@ -2240,28 +2363,58 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               <label htmlFor="in-cs" id="l-cs">
                 COMPUERTA SUBIDA
               </label>
-              <input type="number" id="in-cs" placeholder={phCS || "—"} />
+              <input
+                type="number"
+                id="in-cs"
+                className="input-live-plc"
+                placeholder={phCS || "—"}
+                {...bindLiveField("in-cs")}
+              />
             </div>
             <div className="input-group">
               <label htmlFor="in-cb" id="l-cb">
                 COMPUERTA BAJADA
               </label>
-              <input type="number" id="in-cb" placeholder={phCB || "—"} />
+              <input
+                type="number"
+                id="in-cb"
+                className="input-live-plc"
+                placeholder={phCB || "—"}
+                {...bindLiveField("in-cb")}
+              />
             </div>
             <div className="input-group">
               <label htmlFor="in-ts" id="l-ts">
                 TOLVA SUBIDA
               </label>
-              <input type="number" id="in-ts" placeholder={phTS || "—"} />
+              <input
+                type="number"
+                id="in-ts"
+                className="input-live-plc"
+                placeholder={phTS || "—"}
+                {...bindLiveField("in-ts")}
+              />
             </div>
             <div className="input-group">
               <label htmlFor="in-tb" id="l-tb">
                 TOLVA BAJADA
               </label>
-              <input type="number" id="in-tb" placeholder={phTB || "—"} />
+              <input
+                type="number"
+                id="in-tb"
+                className="input-live-plc"
+                placeholder={phTB || "—"}
+                {...bindLiveField("in-tb")}
+              />
             </div>
           </div>
-          <button type="button" className="boton btn-azul" id="btn-save-t" onClick={saveT}>
+          <button
+            type="button"
+            className="boton btn-azul"
+            id="btn-save-t"
+            onMouseDown={preventSubmitBlur}
+            onClick={saveT}
+          >
             GUARDAR CAMBIOS
           </button>
         </div>
@@ -2339,11 +2492,24 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                 <div className="input-group">
                   <label htmlFor="id-uni">ID UNIDAD</label>
-                  <input type="text" id="id-uni" placeholder={mqttUnitId} autoComplete="off" />
+                  <input
+                    type="text"
+                    id="id-uni"
+                    className="input-live-plc"
+                    placeholder={mqttUnitId}
+                    autoComplete="off"
+                    {...bindLiveField("id-uni")}
+                  />
                 </div>
                 <div className="input-group">
                   <label htmlFor="tok-uni">TOKEN API</label>
-                  <input type="text" id="tok-uni" placeholder="••••••" />
+                  <input
+                    type="text"
+                    id="tok-uni"
+                    className="input-live-plc"
+                    placeholder="••••••"
+                    {...bindLiveField("tok-uni")}
+                  />
                 </div>
               </div>
             </div>
@@ -2354,19 +2520,38 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                 <div className="input-group">
                   <label htmlFor="lim-c">LÍMITE CICLOS</label>
-                  <input type="number" id="lim-c" placeholder={phLC || "—"} />
+                  <input
+                    type="number"
+                    id="lim-c"
+                    className="input-live-plc"
+                    placeholder={phLC || "—"}
+                    {...bindLiveField("lim-c")}
+                  />
                 </div>
                 <div className="input-group">
                   <label htmlFor="lim-m">LÍMITE HORAS</label>
-                  <input type="number" id="lim-m" placeholder={phLM || "—"} />
+                  <input
+                    type="number"
+                    id="lim-m"
+                    className="input-live-plc"
+                    placeholder={phLM || "—"}
+                    {...bindLiveField("lim-m")}
+                  />
                 </div>
                 <div className="input-group">
                   <label htmlFor="t-apagado">PANTALLA (MIN)</label>
-                  <input type="number" step={0.1} id="t-apagado" placeholder={phTP || "—"} />
+                  <input
+                    type="number"
+                    step={0.1}
+                    id="t-apagado"
+                    className="input-live-plc"
+                    placeholder={phTP || "—"}
+                    {...bindLiveField("t-apagado")}
+                  />
                 </div>
               </div>
             </div>
-            <button type="button" className="boton btn-azul" onClick={guardarTodo}>
+            <button type="button" className="boton btn-azul" onMouseDown={preventSubmitBlur} onClick={guardarTodo}>
               GUARDAR TODO
             </button>
             <button type="button" className="boton btn-gris" onClick={bloquear}>
