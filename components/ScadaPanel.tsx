@@ -458,7 +458,8 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       const next: LogsByDay = { ...prev };
       for (const [day, rows] of Object.entries(grouped)) {
         const base = next[day] ?? [];
-        const merged = [...rows, ...base];
+        /** `cn` puede llegar con retraso: nunca ponerlo delante del stream en vivo. */
+        const merged = [...base, ...rows];
         const seen = new Set<string>();
         next[day] = merged.filter((x) => {
           const k = `${x.time}||${x.event}`.trim();
