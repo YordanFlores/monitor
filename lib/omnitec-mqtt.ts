@@ -1,22 +1,22 @@
 /**
- * WebSocket MQTT (Mosquitto vía mqtt.js).
- * Por defecto (sin NEXT_PUBLIC_MQTT_WS_URL): mismo esquema que página + host o broker LAN.
+ * WebSocket MQTT (Mosquitto vía mqtt.connect — no usar `new WebSocket` directo).
+ * Por defecto: producción HTTPS + omnitec.store → wss://{host}/ws (Nginx); en casa/LAN → broker por IP.
  * Override: NEXT_PUBLIC_MQTT_WS_URL (+ opcional NEXT_PUBLIC_MQTT_WS_PATH).
  */
 
-/** URL por defecto: dominio omnitec → /ws (Nginx); si no, broker en LAN. */
+/** Lógica de conexión: servidor seguro vs red local (misma idea que getSocketUrl industrial). */
 function getDefaultMqttWebSocketUrl(): string {
   if (typeof window === "undefined") {
     return "ws://192.168.100.40:9001";
   }
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const isSecure = window.location.protocol === "https:";
   const host = window.location.hostname;
 
-  if (host.includes("omnitec.store")) {
-    return `${protocol}//${host}/ws`;
+  if (isSecure && host.includes("omnitec.store")) {
+    return `wss://${host}/ws`;
   }
 
-  return `${protocol}//192.168.100.40:9001`;
+  return "ws://192.168.100.40:9001";
 }
 
 function appendMqttPath(base: string, extraPath: string): string {
