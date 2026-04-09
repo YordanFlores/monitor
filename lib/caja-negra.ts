@@ -46,6 +46,18 @@ export function getColorForEvent(ev: string): string {
 /** Día + eventos; días más recientes primero; dentro de cada día, eventos más recientes arriba (como el AP). */
 export type CajaDayBlock = { day: string; items: { time: string; event: string }[] };
 
+function timeToMinutes12h(t: string): number | null {
+  const m = t.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (!m) return null;
+  let hh = Number(m[1]);
+  const mm = Number(m[2]);
+  const ap = m[3].toUpperCase();
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  if (hh === 12) hh = 0;
+  const base = ap === "PM" ? hh + 12 : hh;
+  return base * 60 + mm;
+}
+
 export function buildCajaDayBlocks(grouped: LogsByDay): CajaDayBlock[] {
   const dayKeys = Object.keys(grouped).sort((a, b) => {
     const pa = a.split("/");
@@ -56,7 +68,12 @@ export function buildCajaDayBlocks(grouped: LogsByDay): CajaDayBlock[] {
   });
   return dayKeys.map((day) => ({
     day,
-    items: [...grouped[day]].reverse(),
+    items: [...grouped[day]].sort((a, b) => {
+      const ta = timeToMinutes12h(a.time);
+      const tb = timeToMinutes12h(b.time);
+      if (ta == null || tb == null) return 0;
+      return tb - ta; // más recientes primero
+    }),
   }));
 }
 

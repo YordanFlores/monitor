@@ -422,6 +422,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   const pendingTelRef = useRef<Telemetry | null>(null);
   /** Si el historial vino de GET /api/unit-logs, no lo pisa la telemetría `cn` (suele ser más corta / otro formato). */
   const cajaFromServerRef = useRef(false);
+  const cmdSeqRef = useRef(0);
 
   const publishCmd = useCallback(
     (payload: Record<string, unknown>): boolean => {
@@ -430,8 +431,9 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         console.warn("[MQTT] No conectado al broker, comando no enviado:", payload);
         return false;
       }
+      const cmdId = `${mqttUnitId}-${Date.now()}-${++cmdSeqRef.current}`;
       const topic = cmdTopic(mqttUnitId);
-      c.publish(topic, JSON.stringify(payload), { qos: 0 });
+      c.publish(topic, JSON.stringify({ ...payload, cmdId }), { qos: 0 });
       return true;
     },
     [mqttUnitId],
@@ -583,6 +585,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
 
     const telT = telemetryTopic(mqttUnitId);
     const ackT = ackTopic(mqttUnitId);
+    const logT = `omnitec/log/${mqttUnitId}`;
 
     const clearTimers = () => {
       if (authTimerRef.current) {
@@ -632,9 +635,10 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
 
     const onConn = () => {
       setMqttConnected(true);
-      console.log("[MQTT] Suscrito a:", telT, ackT);
+      console.log("[MQTT] Suscrito a:", telT, ackT, logT);
       client.subscribe(telT, { qos: 0 });
       client.subscribe(ackT, { qos: 0 });
+      client.subscribe(logT, { qos: 0 });
     };
     client.on("connect", onConn);
     client.on("close", () => setMqttConnected(false));
@@ -652,6 +656,31 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         }
         if (parsed.ok) applyAckOk();
         else applyAckErr(parsed.message);
+        return;
+      }
+
+      if (topic === logT) {
+        const line = buf.toString().trim();
+        if (!line) return;
+        const grouped = groupLogsByDay(line);
+        if (Object.keys(grouped).length === 0) return;
+        setCajaGrouped((prev) => {
+          if (!prev || Object.keys(prev).length === 0) return grouped;
+          const next: LogsByDay = { ...prev };
+          for (const [day, rows] of Object.entries(grouped)) {
+            const base = next[day] ?? [];
+            const merged = [...rows, ...base];
+            const seen = new Set<string>();
+            next[day] = merged.filter((x) => {
+              const k = `${x.time}||${x.event}`.trim();
+              if (!k) return false;
+              if (seen.has(k)) return false;
+              seen.add(k);
+              return true;
+            });
+          }
+          return next;
+        });
         return;
       }
 
