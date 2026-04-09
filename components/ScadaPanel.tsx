@@ -22,6 +22,7 @@ import {
   type LogsByDay,
 } from "@/lib/caja-negra";
 import { type PlcConfigJson, fetchPlcConfig, getEspOrigin, getPlcConfigOrigin } from "@/lib/esp-api";
+import { buildMqttWebSocketUrl, cmdTopic, telemetryTopic } from "@/lib/omnitec-mqtt";
 import {
   mqttPayloadApagadoMin,
   mqttPayloadIdentidad,
@@ -34,28 +35,6 @@ import {
   mqttPayloadSnoozeMante,
 } from "@/lib/plc-mqtt";
 import "./omnitec-scada.css";
-
-/** wss://broker… vía Nginx → Mosquitto (MQTT sobre WebSocket). Ruta opcional con NEXT_PUBLIC_MQTT_WS_PATH=/mqtt */
-function buildMqttWebSocketUrl(): string {
-  const base =
-    typeof process !== "undefined" && process.env.NEXT_PUBLIC_MQTT_WS_URL?.trim()
-      ? process.env.NEXT_PUBLIC_MQTT_WS_URL.trim()
-      : "wss://broker.omnitec.store";
-  const extraPath =
-    typeof process !== "undefined" ? process.env.NEXT_PUBLIC_MQTT_WS_PATH?.trim() ?? "" : "";
-  if (!extraPath) return base;
-  try {
-    const u = new URL(base);
-    if (u.pathname && u.pathname !== "/") return base;
-    u.pathname = extraPath.startsWith("/") ? extraPath : `/${extraPath}`;
-    return u.toString();
-  } catch {
-    return base;
-  }
-}
-
-const cmdTopic = (id: string) => `omnitec/cmd/${id}`;
-const telemetryTopic = (id: string) => `omnitec/telemetry/${id}`;
 const ackTopic = (id: string) => `omnitec/ack/${id}`;
 
 /**
