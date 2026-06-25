@@ -358,6 +358,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   const [historialOpen, setHistorialOpen] = useState(false);
   const [muted, setMuted] = useState(false);
   const [pinLogin, setPinLogin] = useState("");
+  const [loginToken, setLoginToken] = useState("");
   const [loginError, setLoginError] = useState("");
   const [pin, setPin] = useState("");
   const [alertaOpen, setAlertaOpen] = useState(false);
@@ -407,6 +408,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   const historialPanelRef = useRef<HTMLDivElement>(null);
   const pendingAuth = useRef(false);
   const pendingPinCheck = useRef(false);
+  const loginTokenRef = useRef("");
   const authTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pinCheckTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -430,24 +432,13 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   const cajaFromServerRef = useRef(false);
   const cmdSeqRef = useRef(0);
 
-  const publishCmd = useCallback(
-    (payload: Record<string, unknown>): boolean => {
-      const c = clientRef.current;
-      if (!c?.connected) {
-        console.warn("[MQTT] No conectado al broker, comando no enviado:", payload);
-        return false;
-      }
-      const cmdId = `${mqttUnitId}-${Date.now()}-${++cmdSeqRef.current}`;
-      const topic = cmdTopic(mqttUnitId);
-      c.publish(topic, JSON.stringify({ ...payload, cmdId }), { qos: 0 });
-      return true;
-    },
-    [mqttUnitId],
-  );
-
   useEffect(() => {
     telRef.current = tel;
   }, [tel]);
+
+  useEffect(() => {
+    loginTokenRef.current = loginToken.trim();
+  }, [loginToken]);
 
   useEffect(() => {
     pinRef.current = pin;
@@ -513,6 +504,13 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   );
 
   useEffect(() => {
+    const cachedToken = plcConfig?.token?.trim() || plcConfigCache?.token?.trim() || "";
+    if (!cachedToken) return;
+    setLoginToken((cur) => (cur.trim() ? cur : cachedToken));
+    if (!loginTokenRef.current.trim()) loginTokenRef.current = cachedToken;
+  }, [plcConfig?.token, plcConfigCache?.token]);
+
+  useEffect(() => {
     cajaFromServerRef.current = false;
     setLiveFieldFocus(null);
   }, [mqttUnitId]);
@@ -541,6 +539,31 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       toastTimerRef.current = null;
     }, 2500);
   }, []);
+
+  const getApiToken = useCallback(() => {
+    const currentAuth = loginTokenRef.current.trim();
+    return currentAuth || plcConfig?.token?.trim() || plcConfigCache?.token?.trim() || "";
+  }, [plcConfig?.token, plcConfigCache?.token]);
+
+  const publishCmd = useCallback(
+    (payload: Record<string, unknown>): boolean => {
+      const c = clientRef.current;
+      if (!c?.connected) {
+        console.warn("[MQTT] No conectado al broker, comando no enviado:", payload);
+        return false;
+      }
+      const auth = getApiToken();
+      if (!auth) {
+        showLog("TOKEN API REQUERIDO", "var(--rojo)");
+        return false;
+      }
+      const cmdId = `${mqttUnitId}-${Date.now()}-${++cmdSeqRef.current}`;
+      const topic = cmdTopic(mqttUnitId);
+      c.publish(topic, JSON.stringify({ ...payload, auth, cmdId }), { qos: 0 });
+      return true;
+    },
+    [getApiToken, mqttUnitId, showLog],
+  );
 
   const refreshP = useCallback(() => {
     const el = document.getElementById("pin-display");
@@ -612,6 +635,8 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         setAuthenticated(true);
         setPinLogin("");
         setLoginError("");
+        const auth = loginTokenRef.current.trim();
+        if (auth) persistPlcConfigCache({ token: auth });
       }
       if (pendingPinCheck.current) {
         pendingPinCheck.current = false;
@@ -720,7 +745,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       client.end(true);
       clientRef.current = null;
     };
-  }, [mqttUnitId, showLog]);
+  }, [mqttUnitId, showLog, persistPlcConfigCache]);
 
   /**
    * Tras iniciar sesión: lectura única de parámetros NV (GET /api/config).
@@ -743,12 +768,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
   useEffect(() => {
     const d = tel;
     if (!d) return;
-    const pinMatch =
-      rawPinFromESP.trim() === pinLogin.trim() ||
-      (rawPinFromESP.trim().length > 0 &&
-        pinLogin.trim().length > 0 &&
-        rawPinFromESP.trim().padStart(4, "0") === pinLogin.trim().padStart(4, "0"));
-    if (pendingAuth.current && (pinMatch || d.authOk)) {
+    if (pendingAuth.current && d.authOk) {
       pendingAuth.current = false;
       if (authTimerRef.current) {
         clearTimeout(authTimerRef.current);
@@ -757,6 +777,8 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       setAuthenticated(true);
       setPinLogin("");
       setLoginError("");
+      const auth = loginTokenRef.current.trim();
+      if (auth) persistPlcConfigCache({ token: auth });
     }
     if (pendingPinCheck.current && (rawPinFromESP === pin || d.pinCheckOk)) {
       pendingPinCheck.current = false;
@@ -771,7 +793,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       if (edicion) edicion.style.display = "block";
       setPin("");
     }
-  }, [tel, pinLogin, pin, rawPinFromESP]);
+  }, [tel, pin, rawPinFromESP, persistPlcConfigCache]);
 
   useEffect(() => {
     return () => {
@@ -1068,25 +1090,20 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       return;
     }
 
-    if (authTimerRef.current) clearTimeout(authTimerRef.current);
-
-    if (rawPinFromESP !== "" && pinLogin === rawPinFromESP) {
-      setAuthenticated(true);
-      setPinLogin("");
-      setLoginError("");
-      if (configOrigin) {
-        const cfg = await fetchPlcConfig(configOrigin);
-        if (cfg) {
-          setPlcConfig(cfg);
-          persistPlcConfigCache(cfg);
-        }
-      }
+    if (!getApiToken()) {
+      setLoginError("TOKEN API requerido para acceso remoto.");
+      setTimeout(() => setLoginError(""), 5000);
       return;
     }
 
+    if (authTimerRef.current) clearTimeout(authTimerRef.current);
+
     setLoginError("");
     pendingAuth.current = true;
-    publishCmd({ checkPin: pinLogin });
+    if (!publishCmd({ checkPin: pinLogin })) {
+      pendingAuth.current = false;
+      return;
+    }
 
     authTimerRef.current = setTimeout(() => {
       if (pendingAuth.current) {
@@ -1309,11 +1326,11 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       cmds.push(mqttPayloadSetMante(c, m));
     }
 
+    if (Number.isFinite(tp)) cmds.push(mqttPayloadApagadoMin(Math.round(tp as number)));
+
     if (idTyped || tokTyped) {
       cmds.push(mqttPayloadIdentidad(idTyped || idFallback, tokTyped || tokFallback));
     }
-
-    if (Number.isFinite(tp)) cmds.push(mqttPayloadApagadoMin(Math.round(tp as number)));
 
     const draftCache: Partial<PlcConfigJson> = {};
     if (Number.isFinite(lc)) draftCache.lc = Math.round(lc as number);
@@ -1321,7 +1338,6 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     if (Number.isFinite(tp)) draftCache.tp = String(tp);
     if (idTyped) draftCache.id = idTyped;
     if (tokTyped) draftCache.token = tokTyped;
-    if (Object.keys(draftCache).length > 0) persistPlcConfigCache(draftCache);
 
     if (cmds.length === 0) {
       showLog("NADA QUE GUARDAR", "var(--ambar)");
@@ -1333,6 +1349,11 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         showLog("SIN CONEXIÓN MQTT", "var(--rojo)");
         return;
       }
+    }
+    if (Object.keys(draftCache).length > 0) persistPlcConfigCache(draftCache);
+    if (tokTyped) {
+      loginTokenRef.current = tokTyped;
+      setLoginToken(tokTyped);
     }
     clearDirtyLiveFields(["lim-c", "lim-m", "t-apagado", "id-uni", "tok-uni", "new-pin", "new-pin-mante"]);
     if (idTyped) setMqttUnitId(idTyped || idFallback);
@@ -1419,6 +1440,11 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
       showLog("MQTT no conectado: no se puede enviar la URL OTA.", "var(--rojo)");
       return;
     }
+    const auth = getApiToken();
+    if (!auth) {
+      showLog("TOKEN API REQUERIDO", "var(--rojo)");
+      return;
+    }
     setOtaBusy(true);
     try {
       const fd = new FormData();
@@ -1445,7 +1471,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         return;
       }
       const topic = otaTopic(mqttUnitId.trim() || "latest");
-      c.publish(topic, JSON.stringify({ url: data.url }), { qos: 1 });
+      c.publish(topic, JSON.stringify({ auth, url: data.url }), { qos: 1 });
       showLog(`OTA: firmware en servidor; orden enviada por MQTT (${topic})`, "var(--verde)");
       setOtaOpen(false);
     } catch (e) {
@@ -1460,6 +1486,11 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
     const c = clientRef.current;
     if (!c?.connected) {
       showLog("MQTT no conectado: no se puede enviar el cambio de fondo.", "var(--rojo)");
+      return;
+    }
+    const auth = getApiToken();
+    if (!auth) {
+      showLog("TOKEN API REQUERIDO", "var(--rojo)");
       return;
     }
     setLogoUploadBusy(true);
@@ -1526,7 +1557,7 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
         throw new Error(data.error || `Error al guardar el fondo (${upRes.status})`);
       }
       const topic = logoTopic(mqttUnitId.trim() || "latest");
-      c.publish(topic, JSON.stringify({ url: data.url }), { qos: 1 });
+      c.publish(topic, JSON.stringify({ auth, url: data.url }), { qos: 1 });
       showLog(`FONDO ENVIADO: el equipo descargará la imagen por MQTT (${topic})`, "var(--verde)");
     } catch (e) {
       const rawMsg = e instanceof Error ? e.message : String(e);
@@ -1938,6 +1969,30 @@ export function ScadaPanel({ unitId }: { unitId: string }) {
           >
             ACCESO OMNITEC
           </h2>
+          <input
+            type="password"
+            value={loginToken}
+            onChange={(e) => {
+              const next = e.currentTarget.value;
+              loginTokenRef.current = next.trim();
+              setLoginToken(next);
+            }}
+            placeholder={plcConfigCache?.token ? "Token API guardado" : "Token API"}
+            autoComplete="current-password"
+            style={{
+              width: "100%",
+              boxSizing: "border-box",
+              marginTop: 12,
+              padding: "12px 14px",
+              borderRadius: 10,
+              border: "1px solid rgba(255,255,255,0.18)",
+              background: "#080808",
+              color: "white",
+              textAlign: "center",
+              fontWeight: 800,
+              letterSpacing: 1,
+            }}
+          />
           <div
             id="login-pin-display"
             style={{
